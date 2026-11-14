@@ -9,6 +9,10 @@ A live QML editor, runner, debugger, and AI assistant for building and testing M
 - **Console & Interactive REPL:** View `console.log`/`warn`/`error` output and inspect or modify live plugin properties and local variables while paused.
 - **Gemini AI Assistant:** Optionally connect a Google Gemini API key to generate or fix QML code with current editor context and error logs automatically included.
 
+## Screenshot
+
+![Plugin Creator Screenshot](screenshot.png)
+
 ## Installation
 
 1. Download the latest release `.zip` (or clone this repository).
