@@ -1,2 +1,41 @@
-# plugin-creator
-A simple IDE for MuseScore Plugin development
+# Plugin Creator for MuseScore 4
+
+A live QML editor, runner, debugger, and AI assistant for building and testing MuseScore 4 plugins directly inside MuseScore Studio.
+
+## Features
+
+- **Live Editor & Preview:** Write QML plugins and run them immediately inside an embedded preview pane or a detachable floating window (`Float`).
+- **Multi-Breakpoint Debugger:** Click line numbers in the gutter (or press `F9`) to set breakpoints, then step through code (`Step Over`, `Step Into`, `Step Out`).
+- **Console & Interactive REPL:** View `console.log`/`warn`/`error` output and inspect or modify live plugin properties and local variables while paused.
+- **Gemini AI Assistant:** Optionally connect a Google Gemini API key to generate or fix QML code with current editor context and error logs automatically included.
+
+## Installation
+
+1. Download the latest release `.zip` (or clone this repository).
+2. Extract the `plugin-creator` folder into your MuseScore 4 Plugins directory (check **Edit → Preferences → Folders → Plugins** in MuseScore to confirm the exact path, typically `Documents/MuseScore4/Plugins`).
+3. Open MuseScore 4, go to **Home → Plugins** (or **Plugins → Manage plugins...**), and enable **Plugin Creator**.
+
+## Quick Start
+
+1. Launch **Plugin Creator** from the **Plugins** menu.
+2. Edit the starter template or open an existing `.qml` plugin (`Open...`).
+3. Click **▶ Run** (or press `Ctrl+R`) to compile and execute your plugin.
+4. Click any line number in the editor gutter to toggle a breakpoint, then run again to pause and step through execution.
+
+### Keyboard Shortcuts
+
+| Shortcut | Action |
+| :--- | :--- |
+| `Ctrl+R` | Run plugin |
+| `Ctrl+S` | Save current file |
+| `Ctrl+F` / `F3` | Find / Find Next |
+| `F9` | Toggle breakpoint on current line |
+| `F10` | Step Over (when paused) |
+| `F11` / `Shift+F11` | Step Into / Step Out (when paused) |
+| `Esc` | Stop running plugin instance |
+
+## Credits & License
+
+- Created by Marc Sabatella ([Outside Shore Music](https://outsideshore.com)).
+- Developed with assistance from Google Gemini.
+- Dedicated to the public domain under [CC0 1.0 Universal](LICENSE).
