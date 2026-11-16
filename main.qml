@@ -13,7 +13,7 @@ MuseScore {
 
     title: "Plugin Creator"
     description: "Live QML editor, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
-    version: "1.9.5"
+    version: "1.9.6"
     pluginType: "dialog"
     thumbnailName: "thumbnail.png"
     requiresScore: false
@@ -157,33 +157,30 @@ MuseScore {
             }
         }
 
-        Shortcut {
-            sequence: "F10"
-            enabled: root.isStepping
-            onActivated: root.stepOver()
-        }
-
-        Shortcut {
-            sequence: "F11"
-            enabled: root.isStepping
-            onActivated: root.stepInto()
-        }
-
-        Shortcut {
-            sequence: "Shift+F11"
-            enabled: root.isStepping
-            onActivated: root.stepOut()
-        }
-
-        Shortcut {
-            sequence: "Escape"
-            enabled: !!root.activeInstance
-            onActivated: root.stopCode(false)
-        }
-
         Item {
             id: floatingHost
             anchors.fill: parent
+            focus: true
+
+            Keys.onShortcutOverride: function(e) {
+                if (root.isStepping && (e.key === Qt.Key_F10 || e.key === Qt.Key_F11)) {
+                    e.accepted = true
+                }
+            }
+
+            Keys.onPressed: function(e) {
+                if (root.isStepping && e.key === Qt.Key_F10) {
+                    root.stepOver()
+                    e.accepted = true
+                } else if (root.isStepping && e.key === Qt.Key_F11) {
+                    if (e.modifiers & Qt.ShiftModifier) {
+                        root.stepOut()
+                    } else {
+                        root.stepInto()
+                    }
+                    e.accepted = true
+                }
+            }
         }
     }
 
@@ -423,7 +420,6 @@ MuseScore {
 
     QtObject {
         id: sandboxConsole
-
         function log() {
             var msg = Array.prototype.slice.call(arguments).join(" ")
             root.logMessage("LOG", msg, "#9cdcfe")
@@ -1634,7 +1630,7 @@ MuseScore {
         var returnSuffix = isSignal ? "" : " return __m.retVal;"
 
         return headerPrefix + varHeader
-            + "var __m = { pc: " + entryPc + ", retVal: undefined"
+            + "var __m = { pc: " + entryPc + ", retVal: undefined, applyRetVal: null"
             + ", localNames: " + localNamesJson
             + ", evalLocal: function(__expr) { try { return eval(\"(\" + __expr + \")\"); } catch (e) { if (e instanceof SyntaxError) return eval(__expr); throw e; } }"
             + ", lines: { " + lineMapPairs.join(", ") + " }"
@@ -1786,55 +1782,6 @@ MuseScore {
         }
     }
 
-    Shortcut {
-        sequence: "Escape"
-        onActivated: {
-            if (unsavedOverlay.visible) {
-                root.pendingDiscardAction = ""
-                unsavedOverlay.visible = false
-                editor.forceActiveFocus()
-            } else if (root.showFindBar) {
-                root.showFindBar = false
-                editor.forceActiveFocus()
-            } else if (root.activeInstance) {
-                root.stopCode(false)
-            }
-        }
-    }
-
-    Shortcut {
-        sequence: "Ctrl+F"
-        onActivated: root.toggleFind(true)
-    }
-
-    Shortcut {
-        sequence: "F3"
-        onActivated: root.findNext(false)
-    }
-
-    Shortcut {
-        sequence: "F9"
-        onActivated: root.toggleBreakpointAtCursor()
-    }
-
-    Shortcut {
-        sequence: "F10"
-        enabled: root.isStepping
-        onActivated: root.stepOver()
-    }
-
-    Shortcut {
-        sequence: "F11"
-        enabled: root.isStepping
-        onActivated: root.stepInto()
-    }
-
-    Shortcut {
-        sequence: "Shift+F11"
-        enabled: root.isStepping
-        onActivated: root.stepOut()
-    }
-
     Rectangle {
         anchors.fill: parent
         color: ui.theme.backgroundPrimaryColor
@@ -1845,6 +1792,39 @@ MuseScore {
         anchors.fill: parent
         anchors.margins: 10
         spacing: 6
+
+        Keys.onShortcutOverride: function(e) {
+            if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_F) {
+                e.accepted = true
+            } else if (e.key === Qt.Key_F3 || e.key === Qt.Key_F9) {
+                e.accepted = true
+            } else if (root.isStepping && (e.key === Qt.Key_F10 || e.key === Qt.Key_F11)) {
+                e.accepted = true
+            }
+        }
+
+        Keys.onPressed: function(e) {
+            if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_F) {
+                root.toggleFind(true)
+                e.accepted = true
+            } else if (e.key === Qt.Key_F3) {
+                root.findNext(e.modifiers & Qt.ShiftModifier)
+                e.accepted = true
+            } else if (e.key === Qt.Key_F9) {
+                root.toggleBreakpointAtCursor()
+                e.accepted = true
+            } else if (root.isStepping && e.key === Qt.Key_F10) {
+                root.stepOver()
+                e.accepted = true
+            } else if (root.isStepping && e.key === Qt.Key_F11) {
+                if (e.modifiers & Qt.ShiftModifier) {
+                    root.stepOut()
+                } else {
+                    root.stepInto()
+                }
+                e.accepted = true
+            }
+        }
 
         // Tier 1 Top Toolbar: Side-Park Toggle + Compact File & Workspace Actions
         RowLayout {
@@ -2344,6 +2324,9 @@ MuseScore {
                                          event.key === Qt.Key_V || event.key === Qt.Key_X ||
                                          event.key === Qt.Key_A)) {
                                         event.accepted = true
+                                    } else if (event.key === Qt.Key_F3 || event.key === Qt.Key_F9 ||
+                                               (root.isStepping && (event.key === Qt.Key_F10 || event.key === Qt.Key_F11))) {
+                                        event.accepted = true
                                     }
                                 }
 
@@ -2420,7 +2403,7 @@ MuseScore {
                     }
                     ToolBtn {
                         text: "■"
-                        tip: "Stop running plugin instance (Esc)"
+                        tip: "Stop running plugin instance"
                         enabled: !!root.activeInstance
                         onClicked: root.stopCode(false)
                     }

@@ -3,7 +3,7 @@
     "type": "form",
     "title": "Plugin Creator",
     "description": "Live QML editor, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins.",
-    "version": "1.9.5",
+    "version": "1.9.6",
     "author": "Marc Sabatella",
     "category": "Development",
     "thumbnail": "thumbnail.png",
