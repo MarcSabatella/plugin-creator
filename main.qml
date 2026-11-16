@@ -13,7 +13,7 @@ MuseScore {
 
     title: "Plugin Creator"
     description: "Live QML editor, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
-    version: "1.9.0"
+    version: "1.9.5"
     pluginType: "dialog"
     thumbnailName: "thumbnail.png"
     requiresScore: false
@@ -55,11 +55,19 @@ MuseScore {
     property string lastErrorText: ""
     property int aiRetryCount: 0
     property string aiActiveModel: ""
+    property var aiChatHistory: []           // Array of { role: "user"|"model", parts: [{ text: "..." }] }
+    property string pendingAiPrompt: ""
     property bool didInitialWindowPlacement: false
 
-    // REPL History
+    // Side-Park State
+    property bool isParkedSide: false
+    property point savedWindowPos: Qt.point(100, 100)
+
+    // REPL History & Busy State
     property var replHistory: []
     property int replHistoryIdx: -1
+    property bool replBusy: false
+    property string pendingReplExpr: ""
 
     readonly property string defaultDemoCode:
         'import QtQuick\nimport MuseScore 3.0\n\nMuseScore {\n    id: testPlugin\n    property int stepCounter: 0\n\n    // Tip: Click line numbers in the gutter to toggle multiple breakpoints!\n    // Use F10 (Step Over), F11 (Step Into), and Shift+F11 (Step Out).\n    onRun: {\n        console.log("Starting multi-breakpoint demo...")\n        if (!curScore) {\n            console.warn("No score is currently open.")\n            return\n        }\n        runHelper(2)\n        console.log("Back in onRun after helper!")\n    }\n\n    function runHelper(limit) {\n        for (var i = 1; i <= limit; i++) {\n            stepCounter = i\n            console.log("Helper iteration:", i)\n        }\n    }\n}\n'
@@ -99,7 +107,8 @@ MuseScore {
         }
 
         QQC.ToolTip {
-            visible: btn.tip.length > 0 && btnMouse.containsMouse
+            id: btnTip
+            visible: btn.tip.length > 0 && btnMouse.containsMouse && !btnMouse.pressed
             delay: 350
             text: btn.tip
         }
@@ -110,6 +119,7 @@ MuseScore {
             hoverEnabled: true
             enabled: btn.enabled
             cursorShape: btn.enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+            onPressed: btnTip.hide()
             onClicked: btn.clicked()
         }
     }
@@ -117,9 +127,14 @@ MuseScore {
     // Intercept window titlebar X button when buffer has unsaved changes
     Connections {
         target: root.Window.window
+        enabled: !!root.Window.window
         function onClosing(close) {
+            if (!root || !root.Window.window) return
             if (root.isDirty) {
                 close.accepted = false
+                if (root.isParkedSide) {
+                    root.toggleParkWindow()
+                }
                 root.pendingDiscardAction = "close"
                 unsavedOverlay.visible = true
             }
@@ -205,6 +220,70 @@ MuseScore {
         }
     }
 
+    // Yields one UI paint frame so "[REPL] > expr" and "Evaluating..." render immediately
+    Timer {
+        id: replEvalTimer
+        interval: 15
+        repeat: false
+        onTriggered: root.executePendingRepl()
+    }
+
+    // Yields one UI paint frame so button tooltips dismiss and console flushes before execution
+    Timer {
+        id: runDelayTimer
+        interval: 15
+        repeat: false
+        onTriggered: root.executeRunCode()
+    }
+
+    // Smooth horizontal slide animation for parking/restoring the window
+    NumberAnimation {
+        id: parkAnim
+        target: root.Window.window
+        property: "x"
+        duration: 500
+        easing.type: Easing.OutCubic
+        onFinished: {
+            if (!root.isParkedSide && root.Window.window) {
+                root.Window.window.raise()
+                root.Window.window.requestActivate()
+                editor.forceActiveFocus()
+            }
+        }
+    }
+
+    function getAvailableScreenWidth() {
+        var w = root.Window.window
+        if (w && w.screen) {
+            if (w.screen.desktopAvailableWidth > 0) return w.screen.desktopAvailableWidth
+            if (w.screen.width > 0) return w.screen.width
+        }
+        if (root.Screen.desktopAvailableWidth > 0) return root.Screen.desktopAvailableWidth
+        if (root.Screen.width > 0) return root.Screen.width
+        if (Qt.application.screens && Qt.application.screens.length > 0) {
+            var primary = Qt.application.screens[0]
+            if (primary.desktopAvailableWidth > 0) return primary.desktopAvailableWidth
+            if (primary.width > 0) return primary.width
+        }
+        return 1280
+    }
+
+    function getAvailableScreenHeight() {
+        var w = root.Window.window
+        if (w && w.screen) {
+            if (w.screen.desktopAvailableHeight > 0) return w.screen.desktopAvailableHeight
+            if (w.screen.height > 0) return w.screen.height
+        }
+        if (root.Screen.desktopAvailableHeight > 0) return root.Screen.desktopAvailableHeight
+        if (root.Screen.height > 0) return root.Screen.height
+        if (Qt.application.screens && Qt.application.screens.length > 0) {
+            var primary = Qt.application.screens[0]
+            if (primary.desktopAvailableHeight > 0) return primary.desktopAvailableHeight
+            if (primary.height > 0) return primary.height
+        }
+        return 800
+    }
+
     function sizeAndShowFloatingWindow(obj) {
         var desiredW = 800
         var desiredH = 600
@@ -217,15 +296,13 @@ MuseScore {
             else if (obj.height && obj.height > 0) desiredH = obj.height
         }
 
-        var w = root.Window.window
-        var scr = (w && w.screen) ? w.screen : floatingWindow.screen
-        var availW = scr ? (scr.desktopAvailableWidth || scr.width || 1280) : 1280
-        var availH = scr ? (scr.desktopAvailableHeight || scr.height || 800) : 800
+        var availW = getAvailableScreenWidth()
+        var availH = getAvailableScreenHeight()
 
         floatingWindow.width = Math.max(360, Math.min(desiredW, availW - 60))
         floatingWindow.height = Math.max(260, Math.min(desiredH, availH - 80))
         floatingWindow.x = Math.max(24, Math.floor((availW - floatingWindow.width) / 2) + 30)
-        floatingWindow.y = Math.max(32, Math.floor((availH - floatingWindow.height) / 3))
+        floatingWindow.y = Math.max(32, Math.floor((availH - floatingWindow.height) / 2))
         floatingWindow.visible = true
         floatingWindow.raise()
     }
@@ -258,16 +335,41 @@ MuseScore {
         w.maximumWidth = 16777215
         w.maximumHeight = 16777215
 
-        if (!didInitialWindowPlacement && w.screen) {
-            didInitialWindowPlacement = true
-            var availW = w.screen.desktopAvailableWidth || w.screen.width || 1280
-            var availH = w.screen.desktopAvailableHeight || w.screen.height || 800
-            var targetW = Math.min(w.width, availW - 48)
-            var targetH = Math.min(w.height, availH - 64)
+        if (!didInitialWindowPlacement) {
+            var availW = getAvailableScreenWidth()
+            var availH = getAvailableScreenHeight()
+            var targetW = Math.min(w.width > 0 ? w.width : implicitWidth, availW - 48)
+            var targetH = Math.min(w.height > 0 ? w.height : implicitHeight, availH - 64)
             if (targetW > 0) w.width = targetW
             if (targetH > 0) w.height = targetH
-            w.x = Math.max(16, Math.floor((availW - w.width) / 2))
-            w.y = Math.max(24, Math.floor((availH - w.height) / 3))
+            w.x = Math.max(16, Math.floor((availW - targetW) / 2))
+            w.y = Math.max(24, Math.floor((availH - targetH) / 2))
+            if (w.width > 0 && w.height > 0) {
+                didInitialWindowPlacement = true
+            }
+        }
+    }
+
+    function toggleParkWindow() {
+        var w = root.Window.window
+        if (!w) return
+
+        var availW = getAvailableScreenWidth()
+        var peekWidth = mainCol.anchors.margins + parkBtn.width + 6
+
+        parkAnim.stop()
+        if (!isParkedSide) {
+            savedWindowPos = Qt.point(w.x, w.y)
+            isParkedSide = true
+            parkAnim.from = w.x
+            parkAnim.to = availW - peekWidth
+            parkAnim.start()
+        } else {
+            isParkedSide = false
+            w.y = savedWindowPos.y
+            parkAnim.from = w.x
+            parkAnim.to = savedWindowPos.x
+            parkAnim.start()
         }
     }
 
@@ -301,8 +403,27 @@ MuseScore {
         editor.forceActiveFocus()
     }
 
+    Component.onDestruction: {
+        parkAnim.stop()
+        resizeTimer.stop()
+        aiTimeoutTimer.stop()
+        replEvalTimer.stop()
+        runDelayTimer.stop()
+        if (aiProc && aiProc.state !== 0) {
+            aiProc.kill()
+        }
+        if (copyProc && copyProc.state !== 0) {
+            copyProc.kill()
+        }
+        stopCode(true)
+        if (floatingWindow) {
+            floatingWindow.close()
+        }
+    }
+
     QtObject {
         id: sandboxConsole
+
         function log() {
             var msg = Array.prototype.slice.call(arguments).join(" ")
             root.logMessage("LOG", msg, "#9cdcfe")
@@ -459,6 +580,9 @@ MuseScore {
 
     function requestClose() {
         if (isDirty) {
+            if (isParkedSide) {
+                toggleParkWindow()
+            }
             pendingDiscardAction = "close"
             unsavedOverlay.visible = true
         } else {
@@ -492,6 +616,7 @@ MuseScore {
                 root.lastFilePath = p
                 root.breakpointLines = []
                 root.clearDebugState()
+                root.resetAiChat(true)
                 root.setEditorTextClean(fio.read())
                 editor.forceActiveFocus()
                 logMessage("INFO", "Loaded: " + p, "#b5cea8")
@@ -521,6 +646,7 @@ MuseScore {
         stopCode(true)
         breakpointLines = []
         updateLineVisuals()
+        resetAiChat(true)
         currentFilePath = ""
         lastFilePath = ""
         setEditorTextClean(defaultDemoCode)
@@ -564,7 +690,6 @@ MuseScore {
 
         fio.source = currentFilePath
         if (fio.write(editor.text)) {
-            isDirty = false
             cleanTextSnapshot = editor.text
             isDirty = false
             logMessage("INFO", "Saved: " + currentFilePath, "#b5cea8")
@@ -602,7 +727,6 @@ MuseScore {
 
         fio.source = job.dst
         if (ok && fio.exists()) {
-            isDirty = false
             cleanTextSnapshot = editor.text
             isDirty = false
             logMessage("INFO", "Saved: " + job.dst, "#b5cea8")
@@ -673,11 +797,19 @@ MuseScore {
     }
 
     // ------------------------------------------------------------------
-    //  Gemini "Vibe Coding" Integration
+    //  Gemini "Vibe Coding" Integration (Multi-Turn History)
     // ------------------------------------------------------------------
 
     function codeFence() {
         return String.fromCharCode(96, 96, 96)
+    }
+
+    function resetAiChat(silent) {
+        aiChatHistory = []
+        pendingAiPrompt = ""
+        if (!silent) {
+            logMessage("INFO", "Gemini conversation history cleared.", "#c586c0")
+        }
     }
 
     function sendToGemini(overrideModel) {
@@ -693,6 +825,8 @@ MuseScore {
         if (!overrideModel) {
             aiRetryCount = 0
             aiActiveModel = geminiModel.trim() || "gemini-4-hydrogen"
+            pendingAiPrompt = prompt
+            logMessage("PROMPT", "> " + prompt, "#9cdcfe")
         } else {
             aiActiveModel = overrideModel
         }
@@ -729,9 +863,14 @@ MuseScore {
             genConfig.thinkingConfig = { thinkingLevel: "LOW" }
         }
 
+        var trimmedHistory = aiChatHistory.slice(-10)
+        var fullContents = trimmedHistory.concat([
+            { role: "user", parts: [{ text: userContent }] }
+        ])
+
         var payloadObj = {
             system_instruction: { parts: [{ text: sysInstruction }] },
-            contents: [{ role: "user", parts: [{ text: userContent }] }],
+            contents: fullContents,
             generationConfig: genConfig
         }
 
@@ -861,6 +1000,19 @@ MuseScore {
             }
 
             if (extractedCode.indexOf("import ") !== -1 && extractedCode.indexOf("{") !== -1) {
+                if (pendingAiPrompt !== "") {
+                    var modelSummary = explanation.length > 0
+                        ? explanation
+                        : "Updated the QML plugin code as requested."
+                    var nextHist = aiChatHistory.slice()
+                    nextHist.push({ role: "user", parts: [{ text: pendingAiPrompt }] })
+                    nextHist.push({ role: "model", parts: [{ text: modelSummary }] })
+                    aiChatHistory = nextHist
+                    pendingAiPrompt = ""
+                }
+
+                aiPromptField.text = ""
+                aiPromptField.forceActiveFocus()
                 clearDebugState()
                 editor.text = extractedCode + "\n"
                 lastErrorText = ""
@@ -979,6 +1131,12 @@ MuseScore {
             guard++
         }
 
+        if (guard >= 100000) {
+            clearDebugState()
+            logMessage("WARN", "Execution halted after 100,000 steps (possible infinite loop).", "#dcdcaa")
+            return
+        }
+
         if (root.isStepping) {
             return
         }
@@ -1000,8 +1158,14 @@ MuseScore {
         var guard = 0
         while (activeMachine && guard < 100000) {
             if (activeMachine.pc < 0) {
+                var finishedRetVal = activeMachine.retVal
                 if (machineStack.length > 0) {
                     activeMachine = machineStack.pop()
+                    if (activeMachine.applyRetVal) {
+                        activeMachine.applyRetVal(finishedRetVal)
+                        activeMachine.applyRetVal = null
+                    }
+                    firstStep = false
                     continue
                 } else {
                     break
@@ -1048,6 +1212,12 @@ MuseScore {
                 return
             }
             guard++
+        }
+
+        if (guard >= 100000) {
+            clearDebugState()
+            logMessage("WARN", "Execution halted after 100,000 steps (possible infinite loop).", "#dcdcaa")
+            return
         }
 
         var finishedLabel = activeMachine ? activeMachine.label : "handler"
@@ -1354,34 +1524,46 @@ MuseScore {
             return id
         }
 
-        function compileList(nodeList, exitPc) {
+        function compileList(nodeList, exitPc, breakPc, continuePc) {
             if (!nodeList || nodeList.length === 0) return exitPc
             var nextEntry = exitPc
             for (var idx = nodeList.length - 1; idx >= 0; --idx) {
-                nextEntry = compileNode(nodeList[idx], nextEntry)
+                nextEntry = compileNode(nodeList[idx], nextEntry, breakPc, continuePc)
             }
             return nextEntry
         }
 
-        function compileNode(node, nextPc) {
+        function compileNode(node, nextPc, breakPc, continuePc) {
             if (node.type === "stmt") {
                 var stId = allocState(node.line)
                 var c = hoistVars(node.code).trim()
                 if (/^return\b/.test(c)) {
                     var retExpr = c.replace(/^return\b/, "").replace(/;$/, "").trim()
                     states[stId].code = (retExpr ? ("this.retVal = (" + retExpr + "); ") : "") + "this.pc = -1; return;"
+                } else if (/^break\s*;?$/.test(c) && breakPc !== undefined && breakPc !== -1) {
+                    states[stId].code = "this.pc = " + breakPc + ";"
+                } else if (/^continue\s*;?$/.test(c) && continuePc !== undefined && continuePc !== -1) {
+                    states[stId].code = "this.pc = " + continuePc + ";"
                 } else {
                     if (!c.endsWith(";")) c += ";"
-                    states[stId].code = c + " this.pc = " + nextPc + ";"
+                    var assignMatch = c.match(/^([A-Za-z_$][A-Za-z0-9_$.]*)\s*=\s*[^=][\s\S]*;$/)
+                    if (assignMatch) {
+                        var lhs = assignMatch[1]
+                        states[stId].code = "this.pc = " + nextPc + "; "
+                            + "this.applyRetVal = function(v) { " + lhs + " = v; }; "
+                            + c + " if (!root.isStepping) this.applyRetVal = null;"
+                    } else {
+                        states[stId].code = "this.pc = " + nextPc + "; " + c
+                    }
                 }
                 return stId
             }
 
             if (node.type === "if") {
                 var branchId = allocState(node.line)
-                var thenPc = compileList(node.thenNodes, nextPc)
+                var thenPc = compileList(node.thenNodes, nextPc, breakPc, continuePc)
                 var elsePc = (node.elseNodes && node.elseNodes.length > 0)
-                           ? compileList(node.elseNodes, nextPc)
+                           ? compileList(node.elseNodes, nextPc, breakPc, continuePc)
                            : nextPc
                 states[branchId].code = "this.pc = (" + node.cond + ") ? " + thenPc + " : " + elsePc + ";"
                 return branchId
@@ -1389,7 +1571,7 @@ MuseScore {
 
             if (node.type === "while") {
                 var condId = allocState(node.line)
-                var bodyPc = compileList(node.bodyNodes, condId)
+                var bodyPc = compileList(node.bodyNodes, condId, nextPc, condId)
                 states[condId].code = "this.pc = (" + node.cond + ") ? " + bodyPc + " : " + nextPc + ";"
                 return condId
             }
@@ -1398,7 +1580,7 @@ MuseScore {
                 var initId = node.init ? allocState(node.line) : -1
                 var fCondId = allocState(node.line)
                 var updId = node.update ? allocState(node.line) : fCondId
-                var fBodyPc = compileList(node.bodyNodes, updId)
+                var fBodyPc = compileList(node.bodyNodes, updId, nextPc, updId)
 
                 if (node.update) {
                     var uCode = hoistVars(node.update)
@@ -1418,7 +1600,7 @@ MuseScore {
             return nextPc
         }
 
-        var entryPc = compileList(astNodes, -1)
+        var entryPc = compileList(astNodes, -1, -1, -1)
 
         var lineMapPairs = []
         var caseClauses = []
@@ -1493,7 +1675,11 @@ MuseScore {
     function runCode() {
         stopCode(true)
         lastErrorText = ""
+        logMessage("INFO", "Compiling and running" + (popOutPreview ? " in floating window..." : "..."), "#b5cea8")
+        runDelayTimer.restart()
+    }
 
+    function executeRunCode() {
         var instrumentedCode = instrumentBreakpointHandlers(editor.text, breakpointLines)
             .replace(/\bconsole\.(log|warn|error)\s*\(/g, "sandboxConsole.$1(")
             .replace(/\b(?:root\.)?quit\s*\(\s*\)/g, "root.sandboxQuit()")
@@ -1501,7 +1687,6 @@ MuseScore {
         try {
             var baseUrl = currentFilePath ? ("file:///" + currentFilePath.replace(/^\//, "")) : "file:///sandbox.qml"
             var targetParent = popOutPreview ? floatingHost : sandboxHost
-            logMessage("INFO", "Compiling and running" + (popOutPreview ? " in floating window..." : "..."), "#b5cea8")
 
             var obj = Qt.createQmlObject(instrumentedCode, targetParent, baseUrl)
             activeInstance = obj
@@ -1536,6 +1721,7 @@ MuseScore {
     }
 
     function evalInPluginContext(expr) {
+        if (replBusy) return
         var trimmed = expr.trim()
         if (trimmed === "") return
 
@@ -1544,7 +1730,20 @@ MuseScore {
         }
         replHistoryIdx = replHistory.length
 
+        replInput.text = ""
+        pendingReplExpr = trimmed
+        replBusy = true
         logMessage("REPL", "> " + trimmed, "#dcdcaa")
+        replEvalTimer.restart()
+    }
+
+    function executePendingRepl() {
+        var trimmed = pendingReplExpr
+        pendingReplExpr = ""
+        if (trimmed === "") {
+            replBusy = false
+            return
+        }
 
         try {
             var result
@@ -1581,6 +1780,9 @@ MuseScore {
             logMessage("RES", formatValue(result), "#4ec9b0")
         } catch (err) {
             logMessage("ERR", err.toString(), "#f48771")
+        } finally {
+            replBusy = false
+            replInput.forceActiveFocus()
         }
     }
 
@@ -1644,12 +1846,19 @@ MuseScore {
         anchors.margins: 10
         spacing: 6
 
-        // Tier 1 Top Toolbar: Compact File & Workspace Actions
+        // Tier 1 Top Toolbar: Side-Park Toggle + Compact File & Workspace Actions
         RowLayout {
             Layout.fillWidth: true
             Layout.maximumWidth: mainCol.width
             spacing: 5
 
+            ToolBtn {
+                id: parkBtn
+                text: root.isParkedSide ? "|←" : "→|"
+                tip: root.isParkedSide ? "Slide Plugin Creator back into view" : "Slide window to right edge to inspect score"
+                accent: root.isParkedSide
+                onClicked: root.toggleParkWindow()
+            }
             ToolBtn {
                 text: "New"
                 tip: "Start a new plugin buffer"
@@ -1685,11 +1894,6 @@ MuseScore {
                 text: root.showAiBar ? "Hide Gemini" : "Ask Gemini"
                 tip: "Toggle Gemini AI assistant bar"
                 onClicked: root.showAiBar = !root.showAiBar
-            }
-            ToolBtn {
-                text: "Close"
-                tip: "Close Plugin Creator"
-                onClicked: root.requestClose()
             }
         }
 
@@ -1731,7 +1935,7 @@ MuseScore {
 
                     ToolBtn {
                         width: parent.width
-                        text: root.aiBusy ? "Thinking..." : "Send (Ctrl+Enter)"
+                        text: root.aiBusy ? "Thinking..." : "Send (Enter)"
                         accent: true
                         enabled: !root.aiBusy
                         onClicked: root.sendToGemini()
@@ -1773,6 +1977,8 @@ MuseScore {
                         TextEdit {
                             id: aiPromptField
                             width: aiPromptFlick.width
+                            enabled: !root.aiBusy
+                            opacity: root.aiBusy ? 0.55 : 1.0
                             color: ui.theme.fontPrimaryColor
                             font: ui.theme.bodyFont
                             selectByMouse: true
@@ -1780,7 +1986,7 @@ MuseScore {
 
                             Text {
                                 anchors.fill: parent
-                                text: "Describe what you want to add or fix (Ctrl+Enter to send)..."
+                                text: "Describe what you want to add or fix (Enter to send, Shift+Enter for newline)..."
                                 color: ui.theme.fontPrimaryColor
                                 font: ui.theme.bodyFont
                                 opacity: 0.45
@@ -1788,15 +1994,15 @@ MuseScore {
                             }
 
                             Keys.onShortcutOverride: function(e) {
-                                if ((e.modifiers & Qt.ControlModifier) &&
-                                    (e.key === Qt.Key_Return || e.key === Qt.Key_Enter ||
-                                     e.key === Qt.Key_C || e.key === Qt.Key_V ||
-                                     e.key === Qt.Key_X || e.key === Qt.Key_A)) {
+                                if (((e.key === Qt.Key_Return || e.key === Qt.Key_Enter) && !(e.modifiers & Qt.ShiftModifier)) ||
+                                    ((e.modifiers & Qt.ControlModifier) &&
+                                     (e.key === Qt.Key_C || e.key === Qt.Key_V ||
+                                      e.key === Qt.Key_X || e.key === Qt.Key_A))) {
                                     e.accepted = true
                                 }
                             }
                             Keys.onPressed: function(e) {
-                                if ((e.modifiers & Qt.ControlModifier) && (e.key === Qt.Key_Return || e.key === Qt.Key_Enter)) {
+                                if ((e.key === Qt.Key_Return || e.key === Qt.Key_Enter) && !(e.modifiers & Qt.ShiftModifier)) {
                                     root.sendToGemini()
                                     e.accepted = true
                                 }
@@ -1810,6 +2016,27 @@ MuseScore {
                         onPressed: function(mouse) {
                             aiPromptField.forceActiveFocus()
                             mouse.accepted = false
+                        }
+                    }
+
+                    Rectangle {
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 5
+                        visible: root.aiBusy
+                        implicitWidth: thinkingLbl.implicitWidth + 12
+                        implicitHeight: thinkingLbl.implicitHeight + 4
+                        radius: 3
+                        color: ui.theme.accentColor
+
+                        Text {
+                            id: thinkingLbl
+                            anchors.centerIn: parent
+                            text: "Thinking (" + (root.aiActiveModel || "Gemini") + ")..."
+                            font.family: ui.theme.bodyFont.family
+                            font.pixelSize: 11
+                            font.bold: true
+                            color: "#ffffff"
                         }
                     }
                 }
@@ -1858,11 +2085,19 @@ MuseScore {
                         radius: 3
                     }
                 }
+                ToolBtn {
+                    text: root.aiChatHistory.length > 0
+                          ? ("Reset Chat (" + Math.floor(root.aiChatHistory.length / 2) + ")")
+                          : "Reset Chat"
+                    tip: "Clear Gemini multi-turn conversation history"
+                    enabled: root.aiChatHistory.length > 0 && !root.aiBusy
+                    onClicked: root.resetAiChat(false)
+                }
                 MU.StyledTextLabel {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 0
                     elide: Text.ElideRight
-                    text: "Sends current code + last error automatically."
+                    text: "Remembers recent turns + sends current code."
                     opacity: 0.65
                 }
             }
@@ -2374,18 +2609,19 @@ MuseScore {
                                 spacing: 6
 
                                 Text {
-                                    text: root.activeInstance ? "plugin>" : "global>"
+                                    text: root.replBusy ? "eval..." : (root.activeInstance ? "plugin>" : "global>")
                                     font.family: "monospace"
                                     font.pixelSize: 12
                                     font.bold: true
-                                    color: root.activeInstance ? "#4ec9b0" : "#808080"
+                                    color: root.replBusy ? "#dcdcaa" : (root.activeInstance ? "#4ec9b0" : "#808080")
                                 }
 
                                 QQC.TextField {
                                     id: replInput
                                     Layout.fillWidth: true
                                     height: 24
-                                    placeholderText: "Evaluate JS expression in context (Up/Down for history)..."
+                                    enabled: !root.replBusy
+                                    placeholderText: root.replBusy ? "Evaluating..." : "Evaluate JS expression in context (Up/Down for history)..."
                                     font.family: "monospace"
                                     font.pixelSize: 12
                                     color: "#ffffff"
@@ -2412,7 +2648,6 @@ MuseScore {
                                     Keys.onPressed: function(e) {
                                         if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) {
                                             root.evalInPluginContext(replInput.text)
-                                            replInput.text = ""
                                             e.accepted = true
                                         } else if (e.key === Qt.Key_Up) {
                                             if (root.replHistory.length > 0) {
