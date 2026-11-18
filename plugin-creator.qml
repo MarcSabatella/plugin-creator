@@ -13,7 +13,7 @@ MuseScore {
 
     title: "Plugin Creator"
     description: "Live QML editor, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
-    version: "1.9.6"
+    version: "1.9.10"
     pluginType: "dialog"
     thumbnailName: "thumbnail.png"
     requiresScore: false
@@ -29,6 +29,7 @@ MuseScore {
     property string geminiModel: "gemini-4-hydrogen"
 
     // Working state
+    property bool isClosing: false
     property var activeInstance: null
     property var activeMachine: null
     property var machineStack: []
@@ -36,6 +37,7 @@ MuseScore {
     property string stepMode: "none"         // "none" | "over" | "into" | "out" | "continue"
     property int stepTargetDepth: -1
     property bool popOutPreview: false
+    property bool floatingWindowOpened: false
     property var breakpointLines: []         // Array of 1-based line numbers
     property var breakpointRects: []         // Array of { line: int, rect: rect }
     property int debugActiveLine: -1         // 1-based line number currently paused on (-1 = none)
@@ -59,6 +61,10 @@ MuseScore {
     property string pendingAiPrompt: ""
     property bool didInitialWindowPlacement: false
 
+    // Crash-Recovery Backup State
+    property string recoveredBackupCode: ""
+    property string recoveredBackupTargetPath: ""
+
     // Side-Park State
     property bool isParkedSide: false
     property point savedWindowPos: Qt.point(100, 100)
@@ -71,6 +77,59 @@ MuseScore {
 
     readonly property string defaultDemoCode:
         'import QtQuick\nimport MuseScore 3.0\n\nMuseScore {\n    id: testPlugin\n    property int stepCounter: 0\n\n    // Tip: Click line numbers in the gutter to toggle multiple breakpoints!\n    // Use F10 (Step Over), F11 (Step Into), and Shift+F11 (Step Out).\n    onRun: {\n        console.log("Starting multi-breakpoint demo...")\n        if (!curScore) {\n            console.warn("No score is currently open.")\n            return\n        }\n        runHelper(2)\n        console.log("Back in onRun after helper!")\n    }\n\n    function runHelper(limit) {\n        for (var i = 1; i <= limit; i++) {\n            stepCounter = i\n            console.log("Helper iteration:", i)\n        }\n    }\n}\n'
+
+    // Only intercept Escape / Ctrl+O when Plugin Creator's own window is active
+    readonly property bool pluginWindowActive: !!root.Window.window && root.Window.window.active
+
+    Keys.onShortcutOverride: function(e) {
+        if (!root.pluginWindowActive) return
+        if (e.key === Qt.Key_Escape) {
+            e.accepted = true
+        } else if ((e.modifiers & Qt.ControlModifier) && (e.key === Qt.Key_F || e.key === Qt.Key_O)) {
+            e.accepted = true
+        } else if (e.key === Qt.Key_F3 || e.key === Qt.Key_F9) {
+            e.accepted = true
+        } else if (root.isStepping && (e.key === Qt.Key_F10 || e.key === Qt.Key_F11)) {
+            e.accepted = true
+        }
+    }
+
+    Keys.onPressed: function(e) {
+        if (!root.pluginWindowActive) return
+        if (e.key === Qt.Key_Escape) {
+            if (unsavedOverlay.visible) {
+                root.pendingDiscardAction = ""
+                unsavedOverlay.visible = false
+                editor.forceActiveFocus()
+            } else if (root.showFindBar) {
+                root.showFindBar = false
+                editor.forceActiveFocus()
+            }
+            e.accepted = true
+        } else if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_O) {
+            root.openPluginFile()
+            e.accepted = true
+        } else if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_F) {
+            root.toggleFind(true)
+            e.accepted = true
+        } else if (e.key === Qt.Key_F3) {
+            root.findNext(e.modifiers & Qt.ShiftModifier)
+            e.accepted = true
+        } else if (e.key === Qt.Key_F9) {
+            root.toggleBreakpointAtCursor()
+            e.accepted = true
+        } else if (root.isStepping && e.key === Qt.Key_F10) {
+            root.stepOver()
+            e.accepted = true
+        } else if (root.isStepping && e.key === Qt.Key_F11) {
+            if (e.modifiers & Qt.ShiftModifier) {
+                root.stepOut()
+            } else {
+                root.stepInto()
+            }
+            e.accepted = true
+        }
+    }
 
     // Compact, modern flat toolbar button component with hover tooltip
     component ToolBtn: Rectangle {
@@ -108,7 +167,7 @@ MuseScore {
 
         QQC.ToolTip {
             id: btnTip
-            visible: btn.tip.length > 0 && btnMouse.containsMouse && !btnMouse.pressed
+            visible: !root.isClosing && btn.tip.length > 0 && btnMouse.containsMouse && !btnMouse.pressed
             delay: 350
             text: btn.tip
         }
@@ -127,9 +186,9 @@ MuseScore {
     // Intercept window titlebar X button when buffer has unsaved changes
     Connections {
         target: root.Window.window
-        enabled: !!root.Window.window
+        enabled: !root.isClosing && !!root.Window.window
         function onClosing(close) {
-            if (!root || !root.Window.window) return
+            if (!root || root.isClosing || !root.Window.window) return
             if (root.isDirty) {
                 close.accepted = false
                 if (root.isParkedSide) {
@@ -137,6 +196,9 @@ MuseScore {
                 }
                 root.pendingDiscardAction = "close"
                 unsavedOverlay.visible = true
+            } else {
+                root.isClosing = true
+                root.clearBackupTempFile()
             }
         }
     }
@@ -152,7 +214,7 @@ MuseScore {
 
         onClosing: function(close) {
             close.accepted = true
-            if (root.activeInstance) {
+            if (!root.isClosing && root.activeInstance) {
                 root.stopCode(false)
             }
         }
@@ -192,6 +254,7 @@ MuseScore {
     }
 
     FileIO { id: fio }
+    FileIO { id: readerFio }
 
     QProcess {
         id: copyProc
@@ -213,6 +276,18 @@ MuseScore {
             if (root.aiBusy) {
                 root.aiBusy = false
                 root.logMessage("ERR", "Gemini request timed out after 80 seconds.", "#f48771")
+            }
+        }
+    }
+
+    // Debounced autosave timer for manual edits (1.5s after typing stops)
+    Timer {
+        id: autosaveTimer
+        interval: 1500
+        repeat: false
+        onTriggered: {
+            if (!root.isClosing && root.isDirty && !recoveryOverlay.visible) {
+                root.writeBackupTempFile()
             }
         }
     }
@@ -241,12 +316,107 @@ MuseScore {
         duration: 500
         easing.type: Easing.OutCubic
         onFinished: {
-            if (!root.isParkedSide && root.Window.window) {
+            if (!root.isClosing && !root.isParkedSide && root.Window.window) {
                 root.Window.window.raise()
                 root.Window.window.requestActivate()
                 editor.forceActiveFocus()
             }
         }
+    }
+
+    // ------------------------------------------------------------------
+    //  Crash-Recovery Backup Helpers (.tmp in OS tempPath)
+    // ------------------------------------------------------------------
+
+    function getBackupTempPath() {
+        return fio.tempPath().replace(/\\/g, "/") + "/plugin_creator_autosave.qml.tmp"
+    }
+
+    function getBackupMetaPath() {
+        return fio.tempPath().replace(/\\/g, "/") + "/plugin_creator_autosave.meta.tmp"
+    }
+
+    function writeBackupTempFile() {
+        var tmpPath = getBackupTempPath()
+        var metaPath = getBackupMetaPath()
+        fio.source = tmpPath
+        var ok = fio.write(editor.text)
+        if (ok) {
+            fio.source = metaPath
+            fio.write(currentFilePath || "")
+        }
+        return ok
+    }
+
+    function clearBackupTempFile() {
+        autosaveTimer.stop()
+        var tmpPath = getBackupTempPath()
+        var metaPath = getBackupMetaPath()
+        fio.source = tmpPath
+        if (fio.exists()) {
+            fio.remove()
+        }
+        fio.source = metaPath
+        if (fio.exists()) {
+            fio.remove()
+        }
+    }
+
+    function checkAndPromptCrashRecovery() {
+        var tmpPath = getBackupTempPath()
+        var savedCode = readTextFile(tmpPath)
+        if (!savedCode || savedCode.trim() === "") {
+            clearBackupTempFile()
+            return
+        }
+
+        var metaPath = getBackupMetaPath()
+        var targetPath = (readTextFile(metaPath) || "").trim()
+
+        // If the backup matches what was just loaded cleanly from disk, discard the stale backup
+        if (savedCode === editor.text) {
+            clearBackupTempFile()
+            return
+        }
+
+        recoveredBackupCode = savedCode
+        recoveredBackupTargetPath = targetPath
+        recoveryOverlay.visible = true
+    }
+
+    function acceptCrashRecovery() {
+        recoveryOverlay.visible = false
+        var codeToRestore = recoveredBackupCode
+        var pathToRestore = recoveredBackupTargetPath
+        recoveredBackupCode = ""
+        recoveredBackupTargetPath = ""
+
+        if (pathToRestore !== "") {
+            currentFilePath = pathToRestore
+            lastFilePath = pathToRestore
+            var diskContent = readTextFile(pathToRestore)
+            cleanTextSnapshot = (diskContent !== null) ? diskContent : ""
+        } else {
+            currentFilePath = ""
+            cleanTextSnapshot = defaultDemoCode
+        }
+
+        editor.text = codeToRestore
+        resetEditorView()
+        isDirty = (editor.text !== cleanTextSnapshot)
+        writeBackupTempFile()
+        editor.forceActiveFocus()
+        logMessage("INFO", "Restored unsaved backup from previous session"
+            + (currentFilePath ? (" (" + currentFilePath + ")") : "") + ".", "#4ec9b0")
+    }
+
+    function discardCrashRecovery() {
+        recoveryOverlay.visible = false
+        recoveredBackupCode = ""
+        recoveredBackupTargetPath = ""
+        clearBackupTempFile()
+        editor.forceActiveFocus()
+        logMessage("INFO", "Discarded previous session backup.", "#b5cea8")
     }
 
     function getAvailableScreenWidth() {
@@ -300,6 +470,7 @@ MuseScore {
         floatingWindow.height = Math.max(260, Math.min(desiredH, availH - 80))
         floatingWindow.x = Math.max(24, Math.floor((availW - floatingWindow.width) / 2) + 30)
         floatingWindow.y = Math.max(32, Math.floor((availH - floatingWindow.height) / 2))
+        floatingWindowOpened = true
         floatingWindow.visible = true
         floatingWindow.raise()
     }
@@ -325,6 +496,7 @@ MuseScore {
     }
 
     function makeResizable() {
+        if (root.isClosing) return
         var w = root.Window.window
         if (!w) return
         w.minimumWidth = 680
@@ -376,8 +548,12 @@ MuseScore {
         repeat: true
         property int count: 0
         onTriggered: {
+            if (root.isClosing) {
+                stop()
+                return
+            }
             root.makeResizable()
-            if (count < 3) {
+            if (count < 3 && !recoveryOverlay.visible) {
                 editor.forceActiveFocus()
             }
             if (++count >= 10) stop()
@@ -386,36 +562,53 @@ MuseScore {
 
     onRun: {
         resizeTimer.start()
+        var loadedSaved = false
         if (lastFilePath !== "") {
-            fio.source = lastFilePath
-            if (fio.exists()) {
-                currentFilePath = lastFilePath
-                setEditorTextClean(fio.read())
-                editor.forceActiveFocus()
-                logMessage("INFO", "Restored last session file: " + lastFilePath, "#b5cea8")
-                return
+            var restoredContent = readTextFile(lastFilePath)
+            if (restoredContent !== null) {
+                currentFilePath = normalizeLocalPath(lastFilePath)
+                setEditorTextClean(restoredContent)
+                logMessage("INFO", "Restored last session file: " + currentFilePath, "#b5cea8")
+                loadedSaved = true
             }
         }
-        setEditorTextClean(defaultDemoCode)
+        if (!loadedSaved) {
+            setEditorTextClean(defaultDemoCode)
+        }
         editor.forceActiveFocus()
+        checkAndPromptCrashRecovery()
     }
 
     Component.onDestruction: {
+        console.log("Plugin Creator onDestruction...start")
+        root.isClosing = true
         parkAnim.stop()
         resizeTimer.stop()
+        autosaveTimer.stop()
         aiTimeoutTimer.stop()
         replEvalTimer.stop()
         runDelayTimer.stop()
         if (aiProc && aiProc.state !== 0) {
+            console.log("Plugin Creator onDestruction...aiProc")
             aiProc.kill()
         }
         if (copyProc && copyProc.state !== 0) {
+            console.log("Plugin Creator onDestruction...copyProc")
             copyProc.kill()
         }
+        console.log("Plugin Creator onDestruction...stopCode")
         stopCode(true)
-        if (floatingWindow) {
+        if (floatingWindowOpened && floatingWindow) {
+            console.log("Plugin Creator onDestruction...floatingWindow.visible")
+            floatingWindow.visible = false
+            console.log("Plugin Creator onDestruction...floatingWindow.close()")
             floatingWindow.close()
         }
+        if (!recoveryOverlay.visible) {
+            console.log("Plugin Creator onDestruction...temp")
+            clearBackupTempFile()
+        }
+        console.log("Plugin Creator on Destruction...end")
     }
 
     QtObject {
@@ -539,12 +732,17 @@ MuseScore {
     function stopCode(silent) {
         var wasStepping = root.isStepping
         clearDebugState()
-        if (floatingWindow.visible) {
+        if (floatingWindowOpened && floatingWindow && floatingWindow.visible) {
             floatingWindow.visible = false
         }
         if (activeInstance) {
-            activeInstance.destroy()
+            var inst = activeInstance
             activeInstance = null
+            inst.visible = false
+            inst.enabled = false
+            inst.parent = null
+            inst.destroy()
+            gc()
             if (!silent) {
                 logMessage("WARN", "Execution interrupted - child plugin instance destroyed."
                     + (wasStepping ? " (If curScore.startCmd() was open, run curScore.endCmd() in REPL.)" : ""), "#dcdcaa")
@@ -556,17 +754,78 @@ MuseScore {
     //  File Operations & Unsaved-Changes Protection
     // ------------------------------------------------------------------
 
+    function normalizeLocalPath(p) {
+        var clean = String(p || "").replace(/\\/g, "/")
+        if (clean.indexOf("file:///") === 0) {
+            clean = clean.substring(7)
+            if (/^\/[A-Za-z]:\//.test(clean)) clean = clean.substring(1)
+        }
+        return clean
+    }
+
+    function readTextFile(path) {
+        var cleanPath = normalizeLocalPath(path)
+        if (!cleanPath) return null
+        readerFio.source = cleanPath
+        return readerFio.exists() ? readerFio.read() : null
+    }
+
+    function resetEditorView() {
+        editor.cursorPosition = 0
+        var flick = editorScroll.contentItem
+        if (flick) {
+            flick.contentX = 0
+            flick.contentY = 0
+        }
+        if (editorScroll.QQC.ScrollBar.vertical) {
+            editorScroll.QQC.ScrollBar.vertical.position = 0
+        }
+        if (editorScroll.QQC.ScrollBar.horizontal) {
+            editorScroll.QQC.ScrollBar.horizontal.position = 0
+        }
+        updateLineVisuals()
+        Qt.callLater(function() {
+            if (root.isClosing) return
+            if (editor.contentWidth <= 0 && editor.text.length > 0) {
+                editor.wrapMode = TextEdit.Wrap
+                editor.wrapMode = TextEdit.NoWrap
+            }
+            editor.cursorPosition = 0
+            if (editorScroll.contentItem) {
+                editorScroll.contentItem.contentX = 0
+                editorScroll.contentItem.contentY = 0
+            }
+            if (editorScroll.QQC.ScrollBar.vertical) {
+                editorScroll.QQC.ScrollBar.vertical.position = 0
+            }
+            if (editorScroll.QQC.ScrollBar.horizontal) {
+                editorScroll.QQC.ScrollBar.horizontal.position = 0
+            }
+            updateLineVisuals()
+            editor.update()
+        })
+    }
+
     function setEditorTextClean(newText) {
         cleanTextSnapshot = newText
         editor.text = newText
         isDirty = false
+        autosaveTimer.stop()
+        resetEditorView()
+    }
+
+    function cleanQuit() {
+        root.isClosing = true
+        clearBackupTempFile()
+        stopCode(true)
+        root.quit()
     }
 
     function performAfterSaveAction() {
         var act = pendingDiscardAction
         pendingDiscardAction = ""
         if (act === "close") {
-            root.quit()
+            cleanQuit()
         } else if (act === "new") {
             doNewBuffer()
         } else if (act === "open") {
@@ -582,7 +841,7 @@ MuseScore {
             pendingDiscardAction = "close"
             unsavedOverlay.visible = true
         } else {
-            root.quit()
+            cleanQuit()
         }
     }
 
@@ -591,8 +850,9 @@ MuseScore {
         pendingDiscardAction = ""
         unsavedOverlay.visible = false
         isDirty = false
+        clearBackupTempFile()
         if (act === "close") {
-            root.quit()
+            cleanQuit()
         } else if (act === "new") {
             doNewBuffer()
         } else if (act === "open") {
@@ -605,17 +865,20 @@ MuseScore {
         title: "Open QML Plugin"
         type: FileDialog.Open
         onAccepted: {
-            var p = filePath.replace(/\\/g, "/")
-            fio.source = p
-            if (fio.exists()) {
+            var p = root.normalizeLocalPath(filePath)
+            var content = root.readTextFile(p)
+            if (content !== null) {
                 root.currentFilePath = p
                 root.lastFilePath = p
                 root.breakpointLines = []
                 root.clearDebugState()
                 root.resetAiChat(true)
-                root.setEditorTextClean(fio.read())
+                root.clearBackupTempFile()
+                root.setEditorTextClean(content)
                 editor.forceActiveFocus()
-                logMessage("INFO", "Loaded: " + p, "#b5cea8")
+                logMessage("INFO", "Loaded: " + p + " (" + content.length + " chars)", "#b5cea8")
+            } else {
+                logMessage("ERR", "Could not read file: " + p, "#f48771")
             }
         }
     }
@@ -625,7 +888,7 @@ MuseScore {
         title: "Save QML Plugin"
         type: FileDialog.Save
         onAccepted: {
-            var p = filePath.replace(/\\/g, "/")
+            var p = root.normalizeLocalPath(filePath)
             if (!p.toLowerCase().endsWith(".qml")) {
                 p += ".qml"
             }
@@ -643,6 +906,7 @@ MuseScore {
         breakpointLines = []
         updateLineVisuals()
         resetAiChat(true)
+        clearBackupTempFile()
         currentFilePath = ""
         lastFilePath = ""
         setEditorTextClean(defaultDemoCode)
@@ -688,6 +952,7 @@ MuseScore {
         if (fio.write(editor.text)) {
             cleanTextSnapshot = editor.text
             isDirty = false
+            clearBackupTempFile()
             logMessage("INFO", "Saved: " + currentFilePath, "#b5cea8")
             performAfterSaveAction()
             return
@@ -725,6 +990,7 @@ MuseScore {
         if (ok && fio.exists()) {
             cleanTextSnapshot = editor.text
             isDirty = false
+            clearBackupTempFile()
             logMessage("INFO", "Saved: " + job.dst, "#b5cea8")
             performAfterSaveAction()
         } else {
@@ -734,7 +1000,7 @@ MuseScore {
     }
 
     // ------------------------------------------------------------------
-    //  Find Facility & Scrolling
+    //  Find Facility, Go-to-Definition & Scrolling
     // ------------------------------------------------------------------
 
     function toggleFind(openOnly) {
@@ -792,8 +1058,33 @@ MuseScore {
         editorScroll.QQC.ScrollBar.vertical.position = ratio
     }
 
+    function jumpToFunctionDefinition(symbolName) {
+        var name = (symbolName || "").trim()
+        if (!name || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false
+
+        // Do not jump if the user double-clicked directly on the function declaration itself
+        var selStart = editor.selectionStart
+        var beforeSel = editor.text.substring(Math.max(0, selStart - 20), selStart)
+        if (/\bfunction\s+$/.test(beforeSel)) return false
+
+        var escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+        var defRegex = new RegExp("\\bfunction\\s+" + escaped + "\\s*\\(")
+        var match = defRegex.exec(editor.text)
+
+        if (match) {
+            var nameIdx = match.index + match[0].indexOf(name)
+            editor.forceActiveFocus()
+            editor.select(nameIdx, nameIdx + name.length)
+            scrollEditorToRect(editor.positionToRectangle(nameIdx))
+            var lineNum = lineNumberAtOffset(editor.text, nameIdx)
+            logMessage("INFO", "Jumped to function " + name + "() at line " + lineNum + ".", "#b5cea8")
+            return true
+        }
+        return false
+    }
+
     // ------------------------------------------------------------------
-    //  Gemini "Vibe Coding" Integration (Multi-Turn History)
+    //  Gemini "Vibe Coding" Integration (Multi-Turn History + Backup)
     // ------------------------------------------------------------------
 
     function codeFence() {
@@ -817,6 +1108,11 @@ MuseScore {
         }
         var prompt = aiPromptField.text.trim()
         if (!prompt) return
+
+        // Snapshot current editor contents to backup before sending prompt
+        if (isDirty) {
+            writeBackupTempFile()
+        }
 
         if (!overrideModel) {
             aiRetryCount = 0
@@ -1011,8 +1307,14 @@ MuseScore {
                 aiPromptField.forceActiveFocus()
                 clearDebugState()
                 editor.text = extractedCode + "\n"
+                resetEditorView()
                 lastErrorText = ""
-                logMessage("INFO", "Editor updated by " + aiActiveModel + ". Press Ctrl+R to run.", "#b5cea8")
+
+                // Immediately persist crash-recovery .tmp copy after each Gemini step
+                autosaveTimer.stop()
+                writeBackupTempFile()
+
+                logMessage("INFO", "Editor updated by " + aiActiveModel + " (backup saved). Press Ctrl+R to run.", "#b5cea8")
             } else {
                 logMessage("WARN", "Gemini replied without a recognizable QML file; editor was not overwritten:\n" + replyText, "#dcdcaa")
             }
@@ -1387,6 +1689,24 @@ MuseScore {
             var curLine = baseLine + lineNumberAtOffset(blockSrc, i) - 1
             var rest = blockSrc.substring(i)
 
+            // Hoist nested function declarations out of the switch block and recursively instrument them
+            var fnM = rest.match(/^function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/)
+            if (fnM) {
+                var fOpenB = i + fnM[0].length - 1
+                var fCloseB = findMatchingDelim(blockSrc, fOpenB, "{", "}")
+                if (fCloseB !== -1) {
+                    var fullFnSrc = blockSrc.substring(i, fCloseB + 1)
+                    var subMachine = compileBlockToMachineCode(blockSrc, i, fOpenB, fCloseB, false, fnM[1], fnM[2], baseLine - 1)
+                    nodes.push({
+                        type: "funcDecl",
+                        code: subMachine || fullFnSrc,
+                        line: curLine
+                    })
+                    i = fCloseB + 1
+                    continue
+                }
+            }
+
             if (rest.match(/^if\s*\(/)) {
                 var parsedIf = parseIfAt(i)
                 if (parsedIf) {
@@ -1499,11 +1819,22 @@ MuseScore {
         return nodes
     }
 
-    function compileBlockToMachineCode(src, matchIndex, openBraceIdx, closeBraceIdx, isSignal, targetName, fnParams) {
+    function compileBlockToMachineCode(src, matchIndex, openBraceIdx, closeBraceIdx, isSignal, targetName, fnParams, lineOffset) {
+        var extraOffset = lineOffset || 0
         var body = src.substring(openBraceIdx + 1, closeBraceIdx)
-        var bodyBaseLine = lineNumberAtOffset(src, openBraceIdx + 1)
+        var bodyBaseLine = extraOffset + lineNumberAtOffset(src, openBraceIdx + 1)
         var astNodes = parseBlockToNodes(body, bodyBaseLine)
         if (astNodes.length === 0) return null
+
+        var nestedFuncs = []
+        var execNodes = []
+        for (var nIdx = 0; nIdx < astNodes.length; ++nIdx) {
+            if (astNodes[nIdx].type === "funcDecl") {
+                nestedFuncs.push(astNodes[nIdx].code)
+            } else {
+                execNodes.push(astNodes[nIdx])
+            }
+        }
 
         var sharedVars = {}
         function hoistVars(code) {
@@ -1596,7 +1927,7 @@ MuseScore {
             return nextPc
         }
 
-        var entryPc = compileList(astNodes, -1, -1, -1)
+        var entryPc = compileList(execNodes, -1, -1, -1)
 
         var lineMapPairs = []
         var caseClauses = []
@@ -1609,9 +1940,15 @@ MuseScore {
             ? ("var " + Object.keys(sharedVars).join(", ") + "; ")
             : ""
 
+        var fnHeader = nestedFuncs.length > 0
+            ? (nestedFuncs.join(" ") + " ")
+            : ""
+
         var origNewlines = (src.substring(matchIndex, closeBraceIdx + 1).match(/\n/g) || []).length
+        var generatedNewlines = (fnHeader.match(/\n/g) || []).length
+        var padCount = Math.max(0, origNewlines - generatedNewlines)
         var padNewlines = ""
-        for (var nl = 0; nl < origNewlines; ++nl) padNewlines += "\n"
+        for (var nl = 0; nl < padCount; ++nl) padNewlines += "\n"
 
         // Collect all parameter names and hoisted local variable names for REPL closure inspection
         var paramNames = fnParams
@@ -1629,7 +1966,7 @@ MuseScore {
 
         var returnSuffix = isSignal ? "" : " return __m.retVal;"
 
-        return headerPrefix + varHeader
+        return headerPrefix + varHeader + fnHeader
             + "var __m = { pc: " + entryPc + ", retVal: undefined, applyRetVal: null"
             + ", localNames: " + localNamesJson
             + ", evalLocal: function(__expr) { try { return eval(\"(\" + __expr + \")\"); } catch (e) { if (e instanceof SyntaxError) return eval(__expr); throw e; } }"
@@ -1656,7 +1993,7 @@ MuseScore {
             var closeBraceIdx = findMatchingBrace(src, openBraceIdx)
             if (closeBraceIdx === -1) break
 
-            var replacement = compileBlockToMachineCode(src, match.index, openBraceIdx, closeBraceIdx, isSignal, targetName, fnParams)
+            var replacement = compileBlockToMachineCode(src, match.index, openBraceIdx, closeBraceIdx, isSignal, targetName, fnParams, 0)
             if (replacement) {
                 out += src.substring(lastIdx, match.index) + replacement
                 lastIdx = closeBraceIdx + 1
@@ -1686,6 +2023,15 @@ MuseScore {
 
             var obj = Qt.createQmlObject(instrumentedCode, targetParent, baseUrl)
             activeInstance = obj
+
+            if (obj && obj.Keys) {
+                obj.Keys.shortcutOverride.connect(function(e) {
+                    if (e.key === Qt.Key_Escape) e.accepted = true
+                })
+                obj.Keys.pressed.connect(function(e) {
+                    if (e.key === Qt.Key_Escape) e.accepted = true
+                })
+            }
 
             if (popOutPreview) {
                 sizeAndShowFloatingWindow(obj)
@@ -1792,39 +2138,7 @@ MuseScore {
         anchors.fill: parent
         anchors.margins: 10
         spacing: 6
-
-        Keys.onShortcutOverride: function(e) {
-            if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_F) {
-                e.accepted = true
-            } else if (e.key === Qt.Key_F3 || e.key === Qt.Key_F9) {
-                e.accepted = true
-            } else if (root.isStepping && (e.key === Qt.Key_F10 || e.key === Qt.Key_F11)) {
-                e.accepted = true
-            }
-        }
-
-        Keys.onPressed: function(e) {
-            if ((e.modifiers & Qt.ControlModifier) && e.key === Qt.Key_F) {
-                root.toggleFind(true)
-                e.accepted = true
-            } else if (e.key === Qt.Key_F3) {
-                root.findNext(e.modifiers & Qt.ShiftModifier)
-                e.accepted = true
-            } else if (e.key === Qt.Key_F9) {
-                root.toggleBreakpointAtCursor()
-                e.accepted = true
-            } else if (root.isStepping && e.key === Qt.Key_F10) {
-                root.stepOver()
-                e.accepted = true
-            } else if (root.isStepping && e.key === Qt.Key_F11) {
-                if (e.modifiers & Qt.ShiftModifier) {
-                    root.stepOut()
-                } else {
-                    root.stepInto()
-                }
-                e.accepted = true
-            }
-        }
+        focus: true
 
         // Tier 1 Top Toolbar: Side-Park Toggle + Compact File & Workspace Actions
         RowLayout {
@@ -1846,7 +2160,7 @@ MuseScore {
             }
             ToolBtn {
                 text: "Open..."
-                tip: "Open an existing QML plugin"
+                tip: "Open an existing QML plugin (Ctrl+O)"
                 onClicked: root.openPluginFile()
             }
             ToolBtn {
@@ -2077,7 +2391,7 @@ MuseScore {
                     Layout.fillWidth: true
                     Layout.preferredWidth: 0
                     elide: Text.ElideRight
-                    text: "Remembers recent turns + sends current code."
+                    text: "Remembers recent turns + auto-saves backup."
                     opacity: 0.65
                 }
             }
@@ -2193,8 +2507,9 @@ MuseScore {
                     clip: true
 
                     Row {
-                        width: Math.max(editorScroll.availableWidth, gutter.width + editor.implicitWidth)
-                        height: Math.max(editorScroll.availableHeight, editor.implicitHeight)
+                        id: editorRow
+                        width: Math.max(editorScroll.availableWidth, gutter.width + Math.max(200, editor.contentWidth + 32))
+                        height: Math.max(editorScroll.availableHeight, Math.max(200, editor.contentHeight + 24))
 
                         // Line Number Gutter (Click any line number to toggle breakpoint)
                         Rectangle {
@@ -2264,7 +2579,8 @@ MuseScore {
 
                         // Code Editor with Exact Character-Geometry Highlights
                         Item {
-                            width: Math.max(editorScroll.availableWidth - gutter.width, editor.implicitWidth)
+                            id: editorContainer
+                            width: Math.max(editorScroll.availableWidth - gutter.width, Math.max(200, editor.contentWidth + 32))
                             height: parent.height
 
                             // Subtle Red Tints for All Breakpoint Lines
@@ -2308,21 +2624,61 @@ MuseScore {
                                 rightPadding: 16
 
                                 onImplicitHeightChanged: root.updateLineVisuals()
+                                onCursorRectangleChanged: {
+                                    var vbar = editorScroll.QQC.ScrollBar.vertical
+                                    if (!vbar || editor.implicitHeight <= editorScroll.availableHeight || editorScroll.availableHeight <= 0) return
+                                    if (editor.cursorRectangle.height <= 0) return
+                                    var viewTop = vbar.position * editor.implicitHeight
+                                    var viewBottom = viewTop + editorScroll.availableHeight
+                                    var curTop = editor.cursorRectangle.y
+                                    var curBottom = curTop + editor.cursorRectangle.height
+                                    var maxPos = Math.max(0, 1.0 - vbar.size)
+
+                                    if (curTop < viewTop) {
+                                        vbar.position = Math.min(maxPos, Math.max(0, curTop / editor.implicitHeight))
+                                    } else if (curBottom > viewBottom) {
+                                        var targetTop = curBottom - editorScroll.availableHeight
+                                        vbar.position = Math.min(maxPos, Math.max(0, targetTop / editor.implicitHeight))
+                                    }
+                                }
                                 onTextChanged: {
                                     root.updateLineVisuals()
                                     root.isDirty = (editor.text !== root.cleanTextSnapshot)
+                                    if (root.isDirty && !recoveryOverlay.visible) {
+                                        autosaveTimer.restart()
+                                    }
                                 }
 
                                 background: Rectangle {
                                     color: "transparent"
                                 }
 
+                                // Passive double-tap observer for Go-to-Definition on function calls
+                                TapHandler {
+                                    acceptedButtons: Qt.LeftButton
+                                    onDoubleTapped: function(eventPoint, button) {
+                                        var pos = editor.positionAt(eventPoint.position.x, eventPoint.position.y)
+                                        var t = editor.text
+                                        var start = pos
+                                        var end = pos
+                                        while (start > 0 && /[A-Za-z0-9_$]/.test(t[start - 1])) start--
+                                        while (end < t.length && /[A-Za-z0-9_$]/.test(t[end])) end++
+                                        var word = t.substring(start, end)
+                                        if (word.length > 0 && /^\s*\(/.test(t.substring(end))) {
+                                            root.jumpToFunctionDefinition(word)
+                                        }
+                                    }
+                                }
+
                                 Keys.onShortcutOverride: function(event) {
-                                    if ((event.modifiers & Qt.ControlModifier) &&
+                                    if (event.key === Qt.Key_Escape) {
+                                        event.accepted = true
+                                    } else if ((event.modifiers & Qt.ControlModifier) &&
                                         (event.key === Qt.Key_R || event.key === Qt.Key_S ||
-                                         event.key === Qt.Key_F || event.key === Qt.Key_C ||
-                                         event.key === Qt.Key_V || event.key === Qt.Key_X ||
-                                         event.key === Qt.Key_A)) {
+                                         event.key === Qt.Key_O || event.key === Qt.Key_F ||
+                                         event.key === Qt.Key_C || event.key === Qt.Key_V ||
+                                         event.key === Qt.Key_X || event.key === Qt.Key_A ||
+                                         event.key === Qt.Key_Home || event.key === Qt.Key_End)) {
                                         event.accepted = true
                                     } else if (event.key === Qt.Key_F3 || event.key === Qt.Key_F9 ||
                                                (root.isStepping && (event.key === Qt.Key_F10 || event.key === Qt.Key_F11))) {
@@ -2331,11 +2687,19 @@ MuseScore {
                                 }
 
                                 Keys.onPressed: function(event) {
-                                    if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_R) {
+                                    if (event.key === Qt.Key_Escape) {
+                                        if (root.showFindBar) {
+                                            root.showFindBar = false
+                                        }
+                                        event.accepted = true
+                                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_R) {
                                         root.runCode()
                                         event.accepted = true
                                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_S) {
                                         root.saveCurrentFile()
+                                        event.accepted = true
+                                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_O) {
+                                        root.openPluginFile()
                                         event.accepted = true
                                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_F) {
                                         root.toggleFind(true)
@@ -2438,14 +2802,25 @@ MuseScore {
                     }
 
                     // Top Right: Live UI Preview Box
-                    Rectangle {
+                    FocusScope {
                         id: sandboxHost
                         QQC.SplitView.fillHeight: true
                         QQC.SplitView.minimumHeight: 120
-                        color: ui.theme.backgroundSecondaryColor
-                        border.color: ui.theme.strokeColor
-                        border.width: 1
                         clip: true
+
+                        Rectangle {
+                            anchors.fill: parent
+                            color: ui.theme.backgroundSecondaryColor
+                            border.color: ui.theme.strokeColor
+                            border.width: 1
+                        }
+
+                        Keys.onShortcutOverride: function(e) {
+                            if (e.key === Qt.Key_Escape) e.accepted = true
+                        }
+                        Keys.onPressed: function(e) {
+                            if (e.key === Qt.Key_Escape) e.accepted = true
+                        }
 
                         MU.StyledTextLabel {
                             anchors.centerIn: parent
@@ -2728,6 +3103,72 @@ MuseScore {
                             unsavedOverlay.visible = false
                             root.saveCurrentFile()
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    // Crash-Recovery Backup Prompt Overlay
+    Rectangle {
+        id: recoveryOverlay
+        anchors.fill: parent
+        visible: false
+        color: "#88000000"
+        z: 110
+
+        MouseArea {
+            anchors.fill: parent
+            onClicked: {} // Block clicks to underlying editor
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: 430
+            height: 165
+            radius: 6
+            color: ui.theme.backgroundSecondaryColor
+            border.color: ui.theme.accentColor
+            border.width: 1
+
+            ColumnLayout {
+                anchors.fill: parent
+                anchors.margins: 16
+                spacing: 10
+
+                MU.StyledTextLabel {
+                    text: "Recover Unsaved Session?"
+                    font.pixelSize: 14
+                    font.bold: true
+                }
+
+                MU.StyledTextLabel {
+                    Layout.fillWidth: true
+                    wrapMode: Text.WordWrap
+                    text: "A backup copy from an interrupted session was found"
+                          + (root.recoveredBackupTargetPath
+                             ? (" for " + root.recoveredBackupTargetPath.split("/").pop())
+                             : "")
+                          + ". Would you like to restore it?"
+                }
+
+                Item { Layout.fillHeight: true }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    Item { Layout.fillWidth: true }
+
+                    ToolBtn {
+                        text: "Discard Backup"
+                        onClicked: root.discardCrashRecovery()
+                    }
+
+                    ToolBtn {
+                        text: "Restore Backup"
+                        accent: true
+                        onClicked: root.acceptCrashRecovery()
                     }
                 }
             }
