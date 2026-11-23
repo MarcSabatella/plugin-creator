@@ -13,7 +13,7 @@ MuseScore {
 
     title: "Plugin Creator"
     description: "Live QML editor, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
-    version: "1.9.10"
+    version: "1.12.1"
     pluginType: "dialog"
     thumbnailName: "thumbnail.png"
     requiresScore: false
@@ -38,10 +38,12 @@ MuseScore {
     property int stepTargetDepth: -1
     property bool popOutPreview: false
     property bool floatingWindowOpened: false
+    property var floatingWindow: null
     property var breakpointLines: []         // Array of 1-based line numbers
     property var breakpointRects: []         // Array of { line: int, rect: rect }
     property int debugActiveLine: -1         // 1-based line number currently paused on (-1 = none)
     property rect debugActiveRect: Qt.rect(0, 0, 0, 0)
+    property var braceMatchRects: []         // Array of { rect: rect, matched: bool }
     property string currentFilePath: ""
     property var pendingSave: null
     property bool isDirty: false
@@ -68,6 +70,7 @@ MuseScore {
     // Side-Park State
     property bool isParkedSide: false
     property point savedWindowPos: Qt.point(100, 100)
+    readonly property bool pluginWindowActive: !!root.Window.window && root.Window.window.active
 
     // REPL History & Busy State
     property var replHistory: []
@@ -79,8 +82,6 @@ MuseScore {
         'import QtQuick\nimport MuseScore 3.0\n\nMuseScore {\n    id: testPlugin\n    property int stepCounter: 0\n\n    // Tip: Click line numbers in the gutter to toggle multiple breakpoints!\n    // Use F10 (Step Over), F11 (Step Into), and Shift+F11 (Step Out).\n    onRun: {\n        console.log("Starting multi-breakpoint demo...")\n        if (!curScore) {\n            console.warn("No score is currently open.")\n            return\n        }\n        runHelper(2)\n        console.log("Back in onRun after helper!")\n    }\n\n    function runHelper(limit) {\n        for (var i = 1; i <= limit; i++) {\n            stepCounter = i\n            console.log("Helper iteration:", i)\n        }\n    }\n}\n'
 
     // Only intercept Escape / Ctrl+O when Plugin Creator's own window is active
-    readonly property bool pluginWindowActive: !!root.Window.window && root.Window.window.active
-
     Keys.onShortcutOverride: function(e) {
         if (!root.pluginWindowActive) return
         if (e.key === Qt.Key_Escape) {
@@ -199,49 +200,7 @@ MuseScore {
             } else {
                 root.isClosing = true
                 root.clearBackupTempFile()
-            }
-        }
-    }
-
-    // Floating Preview Window for full-sized plugin UIs
-    Window {
-        id: floatingWindow
-        title: (root.currentFilePath ? root.currentFilePath.split("/").pop() : "Plugin Preview") + " - Live Preview"
-        visible: false
-        color: ui.theme.backgroundSecondaryColor
-        minimumWidth: 320
-        minimumHeight: 240
-
-        onClosing: function(close) {
-            close.accepted = true
-            if (!root.isClosing && root.activeInstance) {
-                root.stopCode(false)
-            }
-        }
-
-        Item {
-            id: floatingHost
-            anchors.fill: parent
-            focus: true
-
-            Keys.onShortcutOverride: function(e) {
-                if (root.isStepping && (e.key === Qt.Key_F10 || e.key === Qt.Key_F11)) {
-                    e.accepted = true
-                }
-            }
-
-            Keys.onPressed: function(e) {
-                if (root.isStepping && e.key === Qt.Key_F10) {
-                    root.stepOver()
-                    e.accepted = true
-                } else if (root.isStepping && e.key === Qt.Key_F11) {
-                    if (e.modifiers & Qt.ShiftModifier) {
-                        root.stepOut()
-                    } else {
-                        root.stepInto()
-                    }
-                    e.accepted = true
-                }
+                root.stopCode(true)
             }
         }
     }
@@ -313,7 +272,7 @@ MuseScore {
         id: parkAnim
         target: root.Window.window
         property: "x"
-        duration: 500
+        duration: 420
         easing.type: Easing.OutCubic
         onFinished: {
             if (!root.isClosing && !root.isParkedSide && root.Window.window) {
@@ -373,7 +332,6 @@ MuseScore {
         var metaPath = getBackupMetaPath()
         var targetPath = (readTextFile(metaPath) || "").trim()
 
-        // If the backup matches what was just loaded cleanly from disk, discard the stale backup
         if (savedCode === editor.text) {
             clearBackupTempFile()
             return
@@ -451,7 +409,31 @@ MuseScore {
         return 800
     }
 
+    function ensureFloatingWindow() {
+        if (floatingWindow) return floatingWindow
+        var titleStr = (root.currentFilePath ? root.currentFilePath.split("/").pop() : "Plugin Preview") + " - Live Preview"
+        var qmlStr =
+            'import QtQuick\nimport QtQuick.Window\n' +
+            'Window {\n' +
+            '    id: fw\n' +
+            '    title: ' + JSON.stringify(titleStr) + '\n' +
+            '    color: "#2b2b2b"\n' +
+            '    minimumWidth: 320\n' +
+            '    minimumHeight: 240\n' +
+            '    property alias hostItem: host\n' +
+            '    onClosing: function(close) {\n' +
+            '        close.accepted = true\n' +
+            '        if (!root.isClosing && root.activeInstance) root.stopCode(false)\n' +
+            '    }\n' +
+            '    Item { id: host; anchors.fill: parent; focus: true }\n' +
+            '}\n'
+        floatingWindow = Qt.createQmlObject(qmlStr, root, "file:///floating_preview.qml")
+        floatingWindowOpened = true
+        return floatingWindow
+    }
+
     function sizeAndShowFloatingWindow(obj) {
+        var fw = ensureFloatingWindow()
         var desiredW = 800
         var desiredH = 600
 
@@ -466,20 +448,20 @@ MuseScore {
         var availW = getAvailableScreenWidth()
         var availH = getAvailableScreenHeight()
 
-        floatingWindow.width = Math.max(360, Math.min(desiredW, availW - 60))
-        floatingWindow.height = Math.max(260, Math.min(desiredH, availH - 80))
-        floatingWindow.x = Math.max(24, Math.floor((availW - floatingWindow.width) / 2) + 30)
-        floatingWindow.y = Math.max(32, Math.floor((availH - floatingWindow.height) / 2))
-        floatingWindowOpened = true
-        floatingWindow.visible = true
-        floatingWindow.raise()
+        fw.width = Math.max(360, Math.min(desiredW, availW - 60))
+        fw.height = Math.max(260, Math.min(desiredH, availH - 80))
+        fw.x = Math.max(24, Math.floor((availW - fw.width) / 2) + 30)
+        fw.y = Math.max(32, Math.floor((availH - fw.height) / 2))
+        fw.visible = true
+        fw.raise()
     }
 
     function togglePopOutPreview() {
         popOutPreview = !popOutPreview
         if (popOutPreview) {
+            var fw = ensureFloatingWindow()
             if (activeInstance) {
-                activeInstance.parent = floatingHost
+                activeInstance.parent = fw.hostItem
                 sizeAndShowFloatingWindow(activeInstance)
             } else {
                 sizeAndShowFloatingWindow(null)
@@ -489,7 +471,12 @@ MuseScore {
             if (activeInstance) {
                 activeInstance.parent = sandboxHost
             }
-            floatingWindow.visible = false
+            if (floatingWindow) {
+                floatingWindow.visible = false
+                floatingWindow.destroy()
+                floatingWindow = null
+                floatingWindowOpened = false
+            }
             editor.forceActiveFocus()
             logMessage("INFO", "Preview docked back into main window.", "#b5cea8")
         }
@@ -528,16 +515,23 @@ MuseScore {
 
         parkAnim.stop()
         if (!isParkedSide) {
-            savedWindowPos = Qt.point(w.x, w.y)
+            if (w.x < availW - 200) {
+                savedWindowPos = Qt.point(w.x, w.y)
+            } else if (savedWindowPos.x >= availW - 200) {
+                savedWindowPos = Qt.point(Math.max(16, Math.floor((availW - w.width) / 2)), Math.max(24, w.y))
+            }
             isParkedSide = true
             parkAnim.from = w.x
             parkAnim.to = availW - peekWidth
             parkAnim.start()
         } else {
             isParkedSide = false
+            var restoreX = (savedWindowPos.x < availW - 200)
+                           ? savedWindowPos.x
+                           : Math.max(16, Math.floor((availW - w.width) / 2))
             w.y = savedWindowPos.y
             parkAnim.from = w.x
-            parkAnim.to = savedWindowPos.x
+            parkAnim.to = restoreX
             parkAnim.start()
         }
     }
@@ -553,7 +547,7 @@ MuseScore {
                 return
             }
             root.makeResizable()
-            if (count < 3 && !recoveryOverlay.visible) {
+            if (count < 3 && !recoveryOverlay.visible && !root.isParkedSide) {
                 editor.forceActiveFocus()
             }
             if (++count >= 10) stop()
@@ -580,7 +574,6 @@ MuseScore {
     }
 
     Component.onDestruction: {
-        console.log("Plugin Creator onDestruction...start")
         root.isClosing = true
         parkAnim.stop()
         resizeTimer.stop()
@@ -588,27 +581,6 @@ MuseScore {
         aiTimeoutTimer.stop()
         replEvalTimer.stop()
         runDelayTimer.stop()
-        if (aiProc && aiProc.state !== 0) {
-            console.log("Plugin Creator onDestruction...aiProc")
-            aiProc.kill()
-        }
-        if (copyProc && copyProc.state !== 0) {
-            console.log("Plugin Creator onDestruction...copyProc")
-            copyProc.kill()
-        }
-        console.log("Plugin Creator onDestruction...stopCode")
-        stopCode(true)
-        if (floatingWindowOpened && floatingWindow) {
-            console.log("Plugin Creator onDestruction...floatingWindow.visible")
-            floatingWindow.visible = false
-            console.log("Plugin Creator onDestruction...floatingWindow.close()")
-            floatingWindow.close()
-        }
-        if (!recoveryOverlay.visible) {
-            console.log("Plugin Creator onDestruction...temp")
-            clearBackupTempFile()
-        }
-        console.log("Plugin Creator on Destruction...end")
     }
 
     QtObject {
@@ -637,6 +609,346 @@ MuseScore {
     function sandboxQuit() {
         logMessage("INFO", "Plugin called quit() - tearing down preview instance.", "#b5cea8")
         stopCode(true)
+    }
+
+    // ------------------------------------------------------------------
+    //  Editor Ergonomics: Auto-Indent, Electric Braces, Pairs, Comments
+    // ------------------------------------------------------------------
+
+    function replaceEditorRange(startPos, endPos, replacement, newCursorStart, newCursorEnd) {
+        if (endPos > startPos) {
+            editor.remove(startPos, endPos)
+        }
+        if (replacement.length > 0) {
+            editor.insert(startPos, replacement)
+        }
+        if (newCursorEnd !== undefined && newCursorEnd !== newCursorStart) {
+            editor.select(newCursorStart, newCursorEnd)
+        } else {
+            editor.cursorPosition = newCursorStart
+        }
+    }
+
+    function handleEditorEnter() {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        var selEnd = editor.selectionEnd
+        var lineStart = t.lastIndexOf("\n", selStart - 1) + 1
+        var lineEnd = t.indexOf("\n", selEnd)
+        if (lineEnd === -1) lineEnd = t.length
+
+        var beforeCursorOnLine = t.substring(lineStart, selStart)
+        var fullLine = t.substring(lineStart, lineEnd)
+        var indentMatch = beforeCursorOnLine.match(/^([ \t]*)/)
+        var baseIndent = indentMatch ? indentMatch[1] : ""
+
+        // If the current line has nothing but whitespace, clean those spaces off the line we're leaving
+        // while keeping baseIndent for the new line below.
+        if (selStart === selEnd && /^[ \t]+$/.test(fullLine)) {
+            var insertClean = "\n" + baseIndent
+            var targetCleanPos = lineStart + insertClean.length
+            replaceEditorRange(lineStart, lineEnd, insertClean, targetCleanPos, targetCleanPos)
+            return
+        }
+
+        var trimmedBefore = beforeCursorOnLine.replace(/\/\/[^\n]*$/, "").trim()
+        var lastCh = trimmedBefore.length > 0 ? trimmedBefore[trimmedBefore.length - 1] : ""
+        var nextCh = selEnd < t.length ? t[selEnd] : ""
+
+        if (lastCh === "{" && nextCh === "}") {
+            var innerIndent = baseIndent + "    "
+            var insertBlock = "\n" + innerIndent + "\n" + baseIndent
+            var targetPos = selStart + 1 + innerIndent.length
+            replaceEditorRange(selStart, selEnd, insertBlock, targetPos, targetPos)
+            return
+        }
+
+        var extraIndent = (lastCh === "{" || lastCh === "[" || lastCh === "(") ? "    " : ""
+        var insertStr = "\n" + baseIndent + extraIndent
+        var nextPos = selStart + insertStr.length
+        replaceEditorRange(selStart, selEnd, insertStr, nextPos, nextPos)
+    }
+
+    function handleEditorTab(outdent) {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        var selEnd = editor.selectionEnd
+
+        // Single-line without selection: Tab inserts 4 spaces; Shift+Tab outdents current line
+        if (!outdent && selStart === selEnd) {
+            editor.insert(selStart, "    ")
+            editor.cursorPosition = selStart + 4
+            return
+        }
+
+        var blockStart = t.lastIndexOf("\n", selStart - 1) + 1
+        var effectiveEnd = (selEnd > selStart && t[selEnd - 1] === "\n") ? (selEnd - 1) : selEnd
+        var blockEnd = t.indexOf("\n", effectiveEnd)
+        if (blockEnd === -1) blockEnd = t.length
+
+        var lines = t.substring(blockStart, blockEnd).split("\n")
+        var edits = []
+        var lineOffset = blockStart
+        var deltaFirst = 0
+        var deltaTotal = 0
+
+        for (var i = 0; i < lines.length; ++i) {
+            var lineStr = lines[i]
+            if (!outdent) {
+                edits.push({ type: "insert", pos: lineOffset, text: "    " })
+                if (i === 0) deltaFirst = 4
+                deltaTotal += 4
+            } else {
+                var removed = 0
+                if (lineStr.indexOf("    ") === 0) {
+                    removed = 4
+                } else if (lineStr[0] === "\t") {
+                    removed = 1
+                } else {
+                    var leadSpaces = lineStr.match(/^( {1,3})/)
+                    if (leadSpaces) removed = leadSpaces[1].length
+                }
+                if (removed > 0) {
+                    edits.push({ type: "remove", start: lineOffset, end: lineOffset + removed })
+                }
+                if (i === 0) deltaFirst = -removed
+                deltaTotal -= removed
+            }
+            lineOffset += lineStr.length + 1
+        }
+
+        for (var k = edits.length - 1; k >= 0; --k) {
+            var ed = edits[k]
+            if (ed.type === "remove") {
+                editor.remove(ed.start, ed.end)
+            } else {
+                editor.insert(ed.pos, ed.text)
+            }
+        }
+
+        if (selStart === selEnd) {
+            editor.cursorPosition = Math.max(blockStart, selStart + deltaFirst)
+        } else {
+            var newSelStart = Math.max(blockStart, selStart + deltaFirst)
+            var newSelEnd = Math.max(newSelStart, selEnd + deltaTotal)
+            editor.select(newSelStart, newSelEnd)
+        }
+    }
+
+    function handleElectricCloseBrace() {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        var selEnd = editor.selectionEnd
+        var lineStart = t.lastIndexOf("\n", selStart - 1) + 1
+        var beforeOnLine = t.substring(lineStart, selStart)
+
+        if (/^[ \t]+$/.test(beforeOnLine)) {
+            var outdented = beforeOnLine.indexOf("    ") === 0
+                ? beforeOnLine.substring(4)
+                : (beforeOnLine[0] === "\t" ? beforeOnLine.substring(1) : beforeOnLine.replace(/^ {1,3}/, ""))
+            var newPos = lineStart + outdented.length + 1
+            replaceEditorRange(lineStart, selEnd, outdented + "}", newPos, newPos)
+            return true
+        }
+        return false
+    }
+
+    function handleAutoPair(openCh, closeCh) {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        var selEnd = editor.selectionEnd
+
+        if (selStart !== selEnd) {
+            var selected = t.substring(selStart, selEnd)
+            replaceEditorRange(selStart, selEnd, openCh + selected + closeCh, selStart + 1, selEnd + 1)
+            return true
+        }
+
+        if (openCh === closeCh && selStart < t.length && t[selStart] === closeCh) {
+            editor.cursorPosition = selStart + 1
+            return true
+        }
+
+        var nextCh = selStart < t.length ? t[selStart] : ""
+        if (nextCh === "" || /[\s)\]\};,:]/.test(nextCh)) {
+            if (openCh === closeCh && selStart > 0 && /[A-Za-z0-9_$\"'`]/.test(t[selStart - 1])) {
+                return false
+            }
+            replaceEditorRange(selStart, selEnd, openCh + closeCh, selStart + 1, selStart + 1)
+            return true
+        }
+        return false
+    }
+
+    function handleOvertypeClose(closeCh) {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        if (selStart === editor.selectionEnd && selStart < t.length && t[selStart] === closeCh) {
+            editor.cursorPosition = selStart + 1
+            return true
+        }
+        return false
+    }
+
+    function handleSmartBackspace() {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        if (selStart !== editor.selectionEnd || selStart <= 0 || selStart >= t.length) return false
+        var prev = t[selStart - 1]
+        var next = t[selStart]
+        if ((prev === "(" && next === ")") ||
+            (prev === "[" && next === "]") ||
+            (prev === "{" && next === "}") ||
+            (prev === '"' && next === '"') ||
+            (prev === "'" && next === "'")) {
+            editor.remove(selStart - 1, selStart + 1)
+            editor.cursorPosition = selStart - 1
+            return true
+        }
+        return false
+    }
+
+    function toggleLineComment() {
+        var t = editor.text
+        var selStart = editor.selectionStart
+        var selEnd = editor.selectionEnd
+        var blockStart = t.lastIndexOf("\n", selStart - 1) + 1
+        var effectiveEnd = (selEnd > selStart && t[selEnd - 1] === "\n") ? (selEnd - 1) : selEnd
+        var blockEnd = t.indexOf("\n", effectiveEnd)
+        if (blockEnd === -1) blockEnd = t.length
+
+        var lines = t.substring(blockStart, blockEnd).split("\n")
+        var allCommented = true
+        var minIndent = 9999
+
+        for (var i = 0; i < lines.length; ++i) {
+            if (lines[i].trim() === "") continue
+            if (!/^[ \t]*\/\//.test(lines[i])) {
+                allCommented = false
+            }
+            var m = lines[i].match(/^([ \t]*)/)
+            if (m && m[1].length < minIndent) minIndent = m[1].length
+        }
+        if (minIndent === 9999) minIndent = 0
+
+        var edits = []
+        var lineOffset = blockStart
+        var deltaFirst = 0
+        var deltaTotal = 0
+
+        for (var j = 0; j < lines.length; ++j) {
+            var lineStr = lines[j]
+            if (lineStr.trim() !== "") {
+                if (allCommented) {
+                    var matchUncomment = lineStr.match(/^([ \t]*)(\/\/ ?)/)
+                    if (matchUncomment) {
+                        var remStart = lineOffset + matchUncomment[1].length
+                        var remLen = matchUncomment[2].length
+                        edits.push({ type: "remove", start: remStart, end: remStart + remLen })
+                        if (j === 0) deltaFirst = -remLen
+                        deltaTotal -= remLen
+                    }
+                } else {
+                    var insPos = lineOffset + minIndent
+                    edits.push({ type: "insert", pos: insPos, text: "// " })
+                    if (j === 0) deltaFirst = 3
+                    deltaTotal += 3
+                }
+            }
+            lineOffset += lineStr.length + 1
+        }
+
+        for (var k = edits.length - 1; k >= 0; --k) {
+            var ed = edits[k]
+            if (ed.type === "remove") {
+                editor.remove(ed.start, ed.end)
+            } else {
+                editor.insert(ed.pos, ed.text)
+            }
+        }
+
+        if (selStart === selEnd) {
+            editor.cursorPosition = Math.max(blockStart, selStart + deltaFirst)
+        } else {
+            var s1 = Math.max(blockStart, selStart + deltaFirst)
+            var s2 = Math.max(s1, selEnd + deltaTotal)
+            editor.select(s1, s2)
+        }
+    }
+
+    function findMatchingDelimBackward(src, closeIdx, openCh, closeCh) {
+        var depth = 1
+        var i = closeIdx - 1
+        while (i >= 0 && depth > 0) {
+            var ch = src[i]
+            var lineStart = src.lastIndexOf("\n", i) + 1
+            var prefixOnLine = src.substring(lineStart, i + 1)
+            var slashIdx = prefixOnLine.indexOf("//")
+            if (slashIdx !== -1 && (lineStart + slashIdx) < i) {
+                i = lineStart + slashIdx - 1
+                continue
+            }
+            if (ch === closeCh) depth++
+            else if (ch === openCh) depth--
+            i--
+        }
+        return (depth === 0) ? (i + 1) : -1
+    }
+
+    function updateBraceMatches() {
+        var t = editor.text
+        var pos = editor.cursorPosition
+        if (!t || pos < 0 || pos > t.length || editor.selectionStart !== editor.selectionEnd) {
+            braceMatchRects = []
+            return
+        }
+
+        var openDelims = "{(["
+        var closeDelims = "})]"
+        var targetIdx = -1
+        var ch = ""
+
+        if (pos > 0 && (openDelims.indexOf(t[pos - 1]) !== -1 || closeDelims.indexOf(t[pos - 1]) !== -1)) {
+            targetIdx = pos - 1
+            ch = t[targetIdx]
+        } else if (pos < t.length && (openDelims.indexOf(t[pos]) !== -1 || closeDelims.indexOf(t[pos]) !== -1)) {
+            targetIdx = pos
+            ch = t[targetIdx]
+        }
+
+        if (targetIdx === -1) {
+            braceMatchRects = []
+            return
+        }
+
+        var partnerIdx = -1
+        var openPos = openDelims.indexOf(ch)
+        if (openPos !== -1) {
+            partnerIdx = findMatchingDelim(t, targetIdx, ch, closeDelims[openPos])
+        } else {
+            var closePos = closeDelims.indexOf(ch)
+            partnerIdx = findMatchingDelimBackward(t, targetIdx, openDelims[closePos], ch)
+        }
+
+        var r1 = editor.positionToRectangle(targetIdx)
+        var r2 = editor.positionToRectangle(targetIdx + 1)
+        var w1 = Math.max(7, r2.x > r1.x ? (r2.x - r1.x) : 8)
+        var rect1 = Qt.rect(r1.x, r1.y, w1, r1.height)
+
+        if (partnerIdx !== -1) {
+            var p1 = editor.positionToRectangle(partnerIdx)
+            var p2 = editor.positionToRectangle(partnerIdx + 1)
+            var pw = Math.max(7, p2.x > p1.x ? (p2.x - p1.x) : 8)
+            var rect2 = Qt.rect(p1.x, p1.y, pw, p1.height)
+            braceMatchRects = [
+                { rect: rect1, matched: true },
+                { rect: rect2, matched: true }
+            ]
+        } else {
+            braceMatchRects = [
+                { rect: rect1, matched: false }
+            ]
+        }
     }
 
     // ------------------------------------------------------------------
@@ -689,6 +1001,8 @@ MuseScore {
         } else {
             debugActiveRect = Qt.rect(0, 0, 0, 0)
         }
+
+        updateBraceMatches()
     }
 
     function toggleBreakpointAtCursor() {
@@ -732,7 +1046,7 @@ MuseScore {
     function stopCode(silent) {
         var wasStepping = root.isStepping
         clearDebugState()
-        if (floatingWindowOpened && floatingWindow && floatingWindow.visible) {
+        if (!root.isClosing && floatingWindowOpened && floatingWindow && floatingWindow.visible) {
             floatingWindow.visible = false
         }
         if (activeInstance) {
@@ -742,7 +1056,9 @@ MuseScore {
             inst.enabled = false
             inst.parent = null
             inst.destroy()
-            gc()
+            if (!root.isClosing) {
+                gc()
+            }
             if (!silent) {
                 logMessage("WARN", "Execution interrupted - child plugin instance destroyed."
                     + (wasStepping ? " (If curScore.startCmd() was open, run curScore.endCmd() in REPL.)" : ""), "#dcdcaa")
@@ -940,6 +1256,38 @@ MuseScore {
     }
 
     function saveCurrentFile() {
+        var vbar = editorScroll.QQC.ScrollBar.vertical
+        var hbar = editorScroll.QQC.ScrollBar.horizontal
+        var savedVPos = vbar ? vbar.position : 0
+        var savedHPos = hbar ? hbar.position : 0
+        var savedCur = editor.cursorPosition
+
+        // Strip trailing whitespace across the buffer without shifting viewport scroll
+        var t = editor.text
+        var matches = []
+        var re = /[ \t]+(?=\r?\n|$)/g
+        var m
+        while ((m = re.exec(t)) !== null) {
+            matches.push({ start: m.index, end: m.index + m[0].length })
+        }
+
+        if (matches.length > 0) {
+            var newCur = savedCur
+            for (var i = matches.length - 1; i >= 0; --i) {
+                var span = matches[i]
+                editor.remove(span.start, span.end)
+                if (newCur > span.start) {
+                    newCur -= Math.min(span.end - span.start, newCur - span.start)
+                }
+            }
+            editor.cursorPosition = Math.max(0, Math.min(newCur, editor.text.length))
+            Qt.callLater(function() {
+                if (root.isClosing) return
+                if (vbar) vbar.position = savedVPos
+                if (hbar) hbar.position = savedHPos
+            })
+        }
+
         if (!currentFilePath) {
             saveDialog.folder = fio.homePath().replace(/\\/g, "/") + "/Documents/MuseScore4/Plugins/new_plugin.qml"
             saveDialog.open()
@@ -1062,7 +1410,6 @@ MuseScore {
         var name = (symbolName || "").trim()
         if (!name || !/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) return false
 
-        // Do not jump if the user double-clicked directly on the function declaration itself
         var selStart = editor.selectionStart
         var beforeSel = editor.text.substring(Math.max(0, selStart - 20), selStart)
         if (/\bfunction\s+$/.test(beforeSel)) return false
@@ -1109,7 +1456,6 @@ MuseScore {
         var prompt = aiPromptField.text.trim()
         if (!prompt) return
 
-        // Snapshot current editor contents to backup before sending prompt
         if (isDirty) {
             writeBackupTempFile()
         }
@@ -1310,7 +1656,6 @@ MuseScore {
                 resetEditorView()
                 lastErrorText = ""
 
-                // Immediately persist crash-recovery .tmp copy after each Gemini step
                 autosaveTimer.stop()
                 writeBackupTempFile()
 
@@ -1395,7 +1740,6 @@ MuseScore {
         }
         activeMachine = machine
 
-        // If user clicked Step Into on the caller, pause right at the first executable line of this callee
         if (stepMode === "into") {
             try {
                 advancePastHelperStates()
@@ -1473,13 +1817,11 @@ MuseScore {
             var curDepth = machineStack.length
             var curLine = activeMachine.lines[activeMachine.pc] || -1
 
-            // Check explicit breakpoints on every non-initial statement
             if (!firstStep && hasBreakpoint(curLine)) {
                 pauseAtCurrentMachine("Paused at breakpoint")
                 return
             }
 
-            // Check single-step stopping criteria once we've advanced off the starting statement
             if (!firstStep && curLine !== -1) {
                 if (mode === "into") {
                     pauseAtCurrentMachine("Line")
@@ -1689,7 +2031,6 @@ MuseScore {
             var curLine = baseLine + lineNumberAtOffset(blockSrc, i) - 1
             var rest = blockSrc.substring(i)
 
-            // Hoist nested function declarations out of the switch block and recursively instrument them
             var fnM = rest.match(/^function\s+([A-Za-z_$][A-Za-z0-9_$]*)\s*\(([^)]*)\)\s*\{/)
             if (fnM) {
                 var fOpenB = i + fnM[0].length - 1
@@ -1790,7 +2131,19 @@ MuseScore {
                 if (inLC) {
                     if (ch === "\n") {
                         inLC = false
-                        if (depth === 0) { i++; break }
+                        if (depth === 0) {
+                            var soFarLc = blockSrc.substring(startStmt, i).replace(/\/\/[^\n]*/g, "").trim()
+                            var afterLc = skipWsAndComments(i + 1)
+                            var nextChLc = afterLc < n ? blockSrc[afterLc] : ""
+                            var nextTwoLc = afterLc + 1 < n ? blockSrc.substring(afterLc, afterLc + 2) : ""
+                            var endsOpLc = /[?:+\-*/%&|=.,]$/.test(soFarLc)
+                            var startsOpLc = (nextChLc === "?" || nextChLc === ":" || nextChLc === "." ||
+                                              nextTwoLc === "&&" || nextTwoLc === "||")
+                            if (!endsOpLc && !startsOpLc) {
+                                i++
+                                break
+                            }
+                        }
                     }
                 } else if (inBC) {
                     if (ch === "*" && nc === "/") { inBC = false; i++ }
@@ -1803,9 +2156,21 @@ MuseScore {
                     else if (ch === '"' || ch === "'") inStr = ch
                     else if (ch === "{" || ch === "(" || ch === "[") depth++
                     else if (ch === "}" || ch === ")" || ch === "]") depth--
-                    else if (depth === 0 && (ch === ";" || ch === "\n")) {
+                    else if (depth === 0 && ch === ";") {
                         i++
                         break
+                    } else if (depth === 0 && ch === "\n") {
+                        var soFar = blockSrc.substring(startStmt, i).replace(/\/\/[^\n]*/g, "").trim()
+                        var afterNl = skipWsAndComments(i + 1)
+                        var nextChAfterNl = afterNl < n ? blockSrc[afterNl] : ""
+                        var nextTwoAfterNl = afterNl + 1 < n ? blockSrc.substring(afterNl, afterNl + 2) : ""
+                        var endsWithOp = /[?:+\-*/%&|=.,]$/.test(soFar)
+                        var startsWithOp = (nextChAfterNl === "?" || nextChAfterNl === ":" || nextChAfterNl === "." ||
+                                            nextTwoAfterNl === "&&" || nextTwoAfterNl === "||")
+                        if (!endsWithOp && !startsWithOp) {
+                            i++
+                            break
+                        }
                     }
                 }
                 i++
@@ -1873,7 +2238,7 @@ MuseScore {
                     states[stId].code = "this.pc = " + continuePc + ";"
                 } else {
                     if (!c.endsWith(";")) c += ";"
-                    var assignMatch = c.match(/^([A-Za-z_$][A-Za-z0-9_$.]*)\s*=\s*[^=][\s\S]*;$/)
+                    var assignMatch = c.match(/^([A-Za-z_$][A-Za-z0-9_$.]*)\s*=\s*([A-Za-z_$][A-Za-z0-9_$.]*\s*\([\s\S]*\))\s*;$/)
                     if (assignMatch) {
                         var lhs = assignMatch[1]
                         states[stId].code = "this.pc = " + nextPc + "; "
@@ -1950,7 +2315,6 @@ MuseScore {
         var padNewlines = ""
         for (var nl = 0; nl < padCount; ++nl) padNewlines += "\n"
 
-        // Collect all parameter names and hoisted local variable names for REPL closure inspection
         var paramNames = fnParams
             ? fnParams.split(",").map(function(p) { return p.trim().split("=")[0].trim() }).filter(function(p) { return p.length > 0 })
             : []
@@ -1975,8 +2339,6 @@ MuseScore {
             + " }; sandboxConsole.runMachine(__m, \"" + targetName + "\");" + returnSuffix + padNewlines + "}"
     }
 
-    // Instruments signal handlers and helper functions whenever any breakpoints are set
-    // so both multi-breakpoints and Step Into (F11) work seamlessly across function calls.
     function instrumentBreakpointHandlers(src, bpLines) {
         if (!bpLines || bpLines.length === 0) return src
 
@@ -2019,7 +2381,7 @@ MuseScore {
 
         try {
             var baseUrl = currentFilePath ? ("file:///" + currentFilePath.replace(/^\//, "")) : "file:///sandbox.qml"
-            var targetParent = popOutPreview ? floatingHost : sandboxHost
+            var targetParent = popOutPreview ? ensureFloatingWindow().hostItem : sandboxHost
 
             var obj = Qt.createQmlObject(instrumentedCode, targetParent, baseUrl)
             activeInstance = obj
@@ -2140,7 +2502,7 @@ MuseScore {
         spacing: 6
         focus: true
 
-        // Tier 1 Top Toolbar: Side-Park Toggle + Compact File & Workspace Actions
+        // Tier 1 Top Toolbar: Side-Park + File Actions + Gemini Toggle
         RowLayout {
             Layout.fillWidth: true
             Layout.maximumWidth: mainCol.width
@@ -2492,7 +2854,7 @@ MuseScore {
                 }
             }
 
-            // Left Pane: Light-Theme Code Editor with Multi-Breakpoint Gutter & Exact Highlights
+            // Left Pane: Light-Theme Code Editor with Multi-Breakpoint Gutter & Bracket Highlights
             Rectangle {
                 QQC.SplitView.fillWidth: true
                 QQC.SplitView.minimumWidth: 260
@@ -2525,7 +2887,7 @@ MuseScore {
                                 color: "#cccccc"
                             }
 
-                            // Red Breakpoint Badges in Gutter (supports multiple breakpoints)
+                            // Red Breakpoint Badges in Gutter
                             Repeater {
                                 model: root.breakpointRects
                                 Rectangle {
@@ -2583,6 +2945,17 @@ MuseScore {
                             width: Math.max(editorScroll.availableWidth - gutter.width, Math.max(200, editor.contentWidth + 32))
                             height: parent.height
 
+                            // Subtle Current-Line Highlight
+                            Rectangle {
+                                visible: editor.activeFocus && !root.isParkedSide
+                                         && editor.cursorRectangle.height > 0 && root.debugActiveLine <= 0
+                                x: 0
+                                y: editor.cursorRectangle.y
+                                width: parent.width
+                                height: editor.cursorRectangle.height
+                                color: "#e8eef5"
+                            }
+
                             // Subtle Red Tints for All Breakpoint Lines
                             Repeater {
                                 model: root.breakpointRects
@@ -2608,9 +2981,26 @@ MuseScore {
                                 border.width: 1
                             }
 
+                            // Live Matching / Unmatched Bracket Highlights
+                            Repeater {
+                                model: root.braceMatchRects
+                                Rectangle {
+                                    x: modelData.rect.x
+                                    y: modelData.rect.y
+                                    width: modelData.rect.width
+                                    height: modelData.rect.height
+                                    radius: 2
+                                    color: modelData.matched ? "#bfe8e2" : "#f8c7c7"
+                                    border.color: modelData.matched ? "#389c8e" : "#d9534f"
+                                    border.width: 1
+                                }
+                            }
+
                             QQC.TextArea {
                                 id: editor
                                 anchors.fill: parent
+                                readOnly: root.isParkedSide
+                                opacity: root.isParkedSide ? 0.65 : 1.0
                                 font.family: "monospace"
                                 font.pixelSize: 13
                                 color: "#111111"
@@ -2624,7 +3014,10 @@ MuseScore {
                                 rightPadding: 16
 
                                 onImplicitHeightChanged: root.updateLineVisuals()
+                                onSelectionStartChanged: root.updateBraceMatches()
+                                onSelectionEndChanged: root.updateBraceMatches()
                                 onCursorRectangleChanged: {
+                                    root.updateBraceMatches()
                                     var vbar = editorScroll.QQC.ScrollBar.vertical
                                     if (!vbar || editor.implicitHeight <= editorScroll.availableHeight || editorScroll.availableHeight <= 0) return
                                     if (editor.cursorRectangle.height <= 0) return
@@ -2671,11 +3064,15 @@ MuseScore {
                                 }
 
                                 Keys.onShortcutOverride: function(event) {
-                                    if (event.key === Qt.Key_Escape) {
+                                    if (!root.pluginWindowActive) return
+                                    if (event.key === Qt.Key_Escape ||
+                                        event.key === Qt.Key_Tab ||
+                                        event.key === Qt.Key_Backtab) {
                                         event.accepted = true
                                     } else if ((event.modifiers & Qt.ControlModifier) &&
                                         (event.key === Qt.Key_R || event.key === Qt.Key_S ||
                                          event.key === Qt.Key_O || event.key === Qt.Key_F ||
+                                         event.key === Qt.Key_Slash ||
                                          event.key === Qt.Key_C || event.key === Qt.Key_V ||
                                          event.key === Qt.Key_X || event.key === Qt.Key_A ||
                                          event.key === Qt.Key_Home || event.key === Qt.Key_End)) {
@@ -2687,6 +3084,7 @@ MuseScore {
                                 }
 
                                 Keys.onPressed: function(event) {
+                                    if (!root.pluginWindowActive) return
                                     if (event.key === Qt.Key_Escape) {
                                         if (root.showFindBar) {
                                             root.showFindBar = false
@@ -2704,6 +3102,45 @@ MuseScore {
                                     } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_F) {
                                         root.toggleFind(true)
                                         event.accepted = true
+                                    } else if ((event.modifiers & Qt.ControlModifier) && event.key === Qt.Key_Slash) {
+                                        if (!editor.readOnly) root.toggleLineComment()
+                                        event.accepted = true
+                                    } else if (event.key === Qt.Key_Tab) {
+                                        if (!editor.readOnly) root.handleEditorTab(event.modifiers & Qt.ShiftModifier)
+                                        event.accepted = true
+                                    } else if (event.key === Qt.Key_Backtab) {
+                                        if (!editor.readOnly) root.handleEditorTab(true)
+                                        event.accepted = true
+                                    } else if (!editor.readOnly && (event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
+                                               && !(event.modifiers & Qt.ControlModifier)) {
+                                        root.handleEditorEnter()
+                                        event.accepted = true
+                                    } else if (!editor.readOnly && event.key === Qt.Key_Backspace && event.modifiers === Qt.NoModifier) {
+                                        if (root.handleSmartBackspace()) {
+                                            event.accepted = true
+                                        }
+                                    } else if (!editor.readOnly && event.text && event.text.length === 1
+                                               && !(event.modifiers & (Qt.ControlModifier | Qt.AltModifier | Qt.MetaModifier))) {
+                                        var ch = event.text
+                                        if (ch === "}") {
+                                            if (root.handleOvertypeClose("}") || root.handleElectricCloseBrace()) {
+                                                event.accepted = true
+                                            }
+                                        } else if (ch === ")" || ch === "]") {
+                                            if (root.handleOvertypeClose(ch)) {
+                                                event.accepted = true
+                                            }
+                                        } else if (ch === "{") {
+                                            if (root.handleAutoPair("{", "}")) event.accepted = true
+                                        } else if (ch === "(") {
+                                            if (root.handleAutoPair("(", ")")) event.accepted = true
+                                        } else if (ch === "[") {
+                                            if (root.handleAutoPair("[", "]")) event.accepted = true
+                                        } else if (ch === '"') {
+                                            if (root.handleAutoPair('"', '"')) event.accepted = true
+                                        } else if (ch === "'") {
+                                            if (root.handleAutoPair("'", "'")) event.accepted = true
+                                        }
                                     }
                                 }
                             }
@@ -2816,10 +3253,10 @@ MuseScore {
                         }
 
                         Keys.onShortcutOverride: function(e) {
-                            if (e.key === Qt.Key_Escape) e.accepted = true
+                            if (root.pluginWindowActive && e.key === Qt.Key_Escape) e.accepted = true
                         }
                         Keys.onPressed: function(e) {
-                            if (e.key === Qt.Key_Escape) e.accepted = true
+                            if (root.pluginWindowActive && e.key === Qt.Key_Escape) e.accepted = true
                         }
 
                         MU.StyledTextLabel {
@@ -3030,6 +3467,19 @@ MuseScore {
                     }
                 }
             }
+        }
+    }
+
+    // Full-window click-to-unpark shield when parked: absorbs the entire click on release
+    // and calls toggleParkWindow() to slide back and unlock the editor.
+    MouseArea {
+        anchors.fill: parent
+        visible: root.isParkedSide
+        z: 90
+        cursorShape: Qt.PointingHandCursor
+        onClicked: function(mouse) {
+            mouse.accepted = true
+            root.toggleParkWindow()
         }
     }
 
