@@ -30,13 +30,15 @@ A live QML editor, runner, debugger, and AI assistant for building and testing M
 
 | Shortcut | Action |
 | :--- | :--- |
-| `Ctrl+R` | Run plugin |
+| `Ctrl+O` | Open file |
 | `Ctrl+S` | Save current file |
 | `Ctrl+F` / `F3` | Find / Find Next |
+| `Ctrl+/` | Toggle comment |
+| `Tab` / `Shift+Tab` | Indent / Outdent |
+| `Ctrl+R` | Run plugin |
 | `F9` | Toggle breakpoint on current line |
 | `F10` | Step Over (when paused) |
 | `F11` / `Shift+F11` | Step Into / Step Out (when paused) |
-| `Esc` | Stop running plugin instance |
 
 ## Credits & License
 
