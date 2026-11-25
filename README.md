@@ -39,6 +39,7 @@ A live QML editor, runner, debugger, and AI assistant for building and testing M
 | `F9` | Toggle breakpoint on current line |
 | `F10` | Step Over (when paused) |
 | `F11` / `Shift+F11` | Step Into / Step Out (when paused) |
+| `Ctrl+Shift+W` | Close window |
 
 ## Credits & License
 
