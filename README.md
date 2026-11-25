@@ -4,7 +4,8 @@ A live QML editor, runner, debugger, and AI assistant for building and testing M
 
 ## Features
 
-- **Live Editor & Preview:** Write QML plugins and run them immediately inside an embedded preview pane or a detachable floating window (`Float`).
+- **Rapid Turnaround:** Write QML plugins and run them inside an embedded preview pane or a detachable floating window (`Float`), with code changes taking effect immediately.
+- **Syntax-Aware Editing:** Editor supports syntax highlighting, find/replace, auto-indent, double-click to go to function definition, external change tracking, and more.
 - **Multi-Breakpoint Debugger:** Click line numbers in the gutter (or press `F9`) to set breakpoints, then step through code (`Step Over`, `Step Into`, `Step Out`).
 - **Console & Interactive REPL:** View `console.log`/`warn`/`error` output and inspect or modify live plugin properties and local variables while paused.
 - **Gemini AI Assistant:** Optionally connect a Google Gemini API key to generate or fix QML code with current editor context and error logs automatically included.
@@ -24,7 +25,8 @@ A live QML editor, runner, debugger, and AI assistant for building and testing M
 1. Launch **Plugin Creator** from the **Plugins** menu.
 2. Edit the starter template or open an existing `.qml` plugin (`Open...`).
 3. Click **▶ Run** (or press `Ctrl+R`) to compile and execute your plugin.
-4. Click any line number in the editor gutter to toggle a breakpoint, then run again to pause and step through execution.
+4. Click any line number in the editor gutter to toggle a breakpoint.
+5. While execution is paused at a breakpoint, you can single-step, evaluate expressions in the console, or continue execution.
 
 ### Keyboard Shortcuts
 
