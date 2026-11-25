@@ -12,8 +12,8 @@ MuseScore {
     id: root
 
     title: "Plugin Creator"
-    description: "Live QML editor with syntax highlighting, find & replace, external file tracking, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
-    version: "1.14.1"
+    description: "Live QML editor with syntax-aware code editing, find & replace, external file tracking, runner, detachable floating preview window, multi-breakpoint step-in/over/out debugger/REPL with local scope inspection, console, and Gemini AI assistant for MuseScore 4 plugins."
+    version: "1.14.2"
     pluginType: "dialog"
     thumbnailName: "thumbnail.png"
     requiresScore: false
@@ -46,6 +46,9 @@ MuseScore {
     property rect debugActiveRect: Qt.rect(0, 0, 0, 0)
     property var braceMatchRects: []         // Array of { rect: rect, matched: bool }
     property string highlightedHtml: ""
+    property real highlightOverlayY: 0
+    property var highlightedLineCache: []
+    property int lastKnownLineCount: 0
     property string currentFilePath: ""
     property var pendingSave: null
     property bool isDirty: false
@@ -266,10 +269,10 @@ MuseScore {
         onTriggered: root.checkExternalFileChange()
     }
 
-    // Debounced syntax-highlighting refresh (40 ms after typing)
+    // Debounced full syntax-highlighting refresh for multi-line edits on large files
     Timer {
         id: highlightTimer
-        interval: 40
+        interval: 60
         repeat: false
         onTriggered: {
             if (!root.isClosing) {
@@ -460,7 +463,7 @@ MuseScore {
             'Window {\n' +
             '    id: fw\n' +
             '    title: ' + JSON.stringify(titleStr) + '\n' +
-            '    color: "#2b2b2b"\n' +
+            '    color: ui.theme.backgroundPrimaryColor\n' +
             '    minimumWidth: 320\n' +
             '    minimumHeight: 240\n' +
             '    property alias hostItem: host\n' +
@@ -511,17 +514,27 @@ MuseScore {
             }
             logMessage("INFO", "Preview popped out to floating window.", "#b5cea8")
         } else {
+            var hadInstance = !!activeInstance
             if (activeInstance) {
                 activeInstance.parent = sandboxHost
+                activeInstance.x = 0
+                activeInstance.y = 0
+                activeInstance.visible = true
+                activeInstance.update()
             }
             if (floatingWindow) {
-                floatingWindow.visible = false
-                floatingWindow.destroy()
+                var fwToClose = floatingWindow
                 floatingWindow = null
                 floatingWindowOpened = false
+                fwToClose.visible = false
+                fwToClose.destroy()
             }
             editor.forceActiveFocus()
-            logMessage("INFO", "Preview docked back into main window.", "#b5cea8")
+            if (hadInstance) {
+                logMessage("INFO", "Preview docked back into main window.", "#b5cea8")
+            } else {
+                logMessage("INFO", "Dock mode restored (click Run to launch plugin in docked preview).", "#b5cea8")
+            }
         }
     }
 
@@ -698,6 +711,7 @@ MuseScore {
             if (root.isClosing) return
             if (vbar) vbar.position = savedVPos
             if (hbar) hbar.position = savedHPos
+            updateVisibleHighlightSlice()
             updateLineVisuals()
         })
 
@@ -743,7 +757,7 @@ MuseScore {
     }
 
     // ------------------------------------------------------------------
-    //  QML / JavaScript Syntax Highlighter (Color-Only Overlay)
+    //  QML / JavaScript Syntax Highlighter (Virtualized Viewport Overlay)
     // ------------------------------------------------------------------
 
     readonly property var syntaxKeywords: ({
@@ -894,9 +908,65 @@ MuseScore {
         return '<span style="color:#111111;">' + out.join("") + '</span>'
     }
 
+    function updateVisibleHighlightSlice() {
+        var cache = highlightedLineCache
+        if (!cache || cache.length === 0) {
+            highlightOverlayY = 0
+            highlightedHtml = ""
+            return
+        }
+
+        var vbar = editorScroll.QQC.ScrollBar.vertical
+        var totalH = editor.implicitHeight
+        var viewH = editorScroll.availableHeight
+        var lineH = (editor.lineCount > 0 && totalH > editor.topPadding + editor.bottomPadding)
+            ? ((totalH - editor.topPadding - editor.bottomPadding) / editor.lineCount)
+            : 16
+
+        var viewTop = (vbar && totalH > viewH) ? (vbar.position * totalH) : 0
+        var firstVis = Math.max(0, Math.floor((viewTop - editor.topPadding) / lineH) - 10)
+        var visCount = Math.ceil((viewH > 0 ? viewH : 600) / lineH) + 22
+        var lastVis = Math.min(cache.length - 1, firstVis + visCount)
+
+        highlightOverlayY = firstVis * lineH
+        highlightedHtml = cache.slice(firstVis, lastVis + 1).join("<br/>")
+    }
+
     function refreshSyntaxHighlight() {
         highlightTimer.stop()
-        highlightedHtml = highlightQmlJs(editor.text)
+        var lines = editor.text.split("\n")
+        var cache = new Array(lines.length)
+        for (var i = 0; i < lines.length; ++i) {
+            cache[i] = highlightQmlJs(lines[i])
+        }
+        highlightedLineCache = cache
+        lastKnownLineCount = lines.length
+        updateVisibleHighlightSlice()
+    }
+
+    function updateHighlightIncremental() {
+        var t = editor.text
+        var lines = t.split("\n")
+        if (lines.length !== highlightedLineCache.length || t.indexOf("/*") !== -1) {
+            if (lines.length <= 400) {
+                refreshSyntaxHighlight()
+            } else {
+                var curIdx = lineNumberAtOffset(t, editor.cursorPosition) - 1
+                if (curIdx >= 0 && curIdx < lines.length && curIdx < highlightedLineCache.length) {
+                    highlightedLineCache[curIdx] = highlightQmlJs(lines[curIdx])
+                    updateVisibleHighlightSlice()
+                }
+                highlightTimer.restart()
+            }
+            return
+        }
+
+        // Single-line edit: re-tokenize ONLY the edited line and render only visible slice
+        var lineIdx = lineNumberAtOffset(t, editor.cursorPosition) - 1
+        if (lineIdx >= 0 && lineIdx < lines.length) {
+            highlightedLineCache[lineIdx] = highlightQmlJs(lines[lineIdx])
+            updateVisibleHighlightSlice()
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1446,6 +1516,7 @@ MuseScore {
             if (editorScroll.QQC.ScrollBar.horizontal) {
                 editorScroll.QQC.ScrollBar.horizontal.position = 0
             }
+            updateVisibleHighlightSlice()
             updateLineVisuals()
             editor.update()
         })
@@ -1690,7 +1761,7 @@ MuseScore {
     }
 
     // ------------------------------------------------------------------
-    //  Find & Replace, Go-to-Definition & Scrolling
+    //  Find & Replace, Go-to-Definition & Viewport Scrolling
     // ------------------------------------------------------------------
 
     function toggleFind(openOnly, focusReplace) {
@@ -1827,17 +1898,67 @@ MuseScore {
             if (root.isClosing) return
             if (vbar) vbar.position = savedVPos
             if (hbar) hbar.position = savedHPos
+            updateVisibleHighlightSlice()
         })
 
         logMessage("INFO", "Replaced " + positions.length + " occurrence" + (positions.length === 1 ? "" : "s") + ".", "#b5cea8")
     }
 
     function scrollEditorToRect(r) {
-        if (r.height <= 0 || !editorScroll.QQC.ScrollBar.vertical) return
-        var targetY = Math.max(0, r.y - editorScroll.availableHeight * 0.35)
-        var maxPos = Math.max(0, 1.0 - editorScroll.QQC.ScrollBar.vertical.size)
-        var ratio = editor.implicitHeight > 0 ? Math.min(maxPos, targetY / editor.implicitHeight) : 0
-        editorScroll.QQC.ScrollBar.vertical.position = ratio
+        if (r.height <= 0) return
+        var vbar = editorScroll.QQC.ScrollBar.vertical
+        if (vbar && editorScroll.availableHeight > 0 && editor.implicitHeight > 0) {
+            var targetY = Math.max(0, r.y - editorScroll.availableHeight * 0.35)
+            var maxVPos = Math.max(0, 1.0 - vbar.size)
+            vbar.position = Math.min(maxVPos, targetY / editor.implicitHeight)
+        }
+        var hbar = editorScroll.QQC.ScrollBar.horizontal
+        var codeViewW = editorScroll.availableWidth - gutter.width
+        var totalRowW = editorRow.width
+        if (hbar && codeViewW > 0 && totalRowW > editorScroll.availableWidth) {
+            var targetX = Math.max(0, r.x - codeViewW * 0.25)
+            var maxHPos = Math.max(0, 1.0 - hbar.size)
+            hbar.position = Math.min(maxHPos, targetX / totalRowW)
+        }
+    }
+
+    function ensureCursorVisibleInViewport() {
+        var r = editor.cursorRectangle
+        if (r.height <= 0) return
+
+        var vbar = editorScroll.QQC.ScrollBar.vertical
+        if (vbar && editor.implicitHeight > editorScroll.availableHeight && editorScroll.availableHeight > 0) {
+            var viewTop = vbar.position * editor.implicitHeight
+            var viewBottom = viewTop + editorScroll.availableHeight
+            var curTop = r.y
+            var curBottom = curTop + r.height
+            var maxVPos = Math.max(0, 1.0 - vbar.size)
+
+            if (curTop < viewTop) {
+                vbar.position = Math.min(maxVPos, Math.max(0, curTop / editor.implicitHeight))
+            } else if (curBottom > viewBottom) {
+                var targetTop = curBottom - editorScroll.availableHeight
+                vbar.position = Math.min(maxVPos, Math.max(0, targetTop / editor.implicitHeight))
+            }
+        }
+
+        var hbar = editorScroll.QQC.ScrollBar.horizontal
+        var codeViewW = editorScroll.availableWidth - gutter.width
+        var totalRowW = editorRow.width
+        if (hbar && totalRowW > editorScroll.availableWidth && codeViewW > 0) {
+            var viewLeft = hbar.position * totalRowW
+            var viewRight = viewLeft + codeViewW
+            var margin = 24
+            var maxHPos = Math.max(0, 1.0 - hbar.size)
+
+            if (r.x < viewLeft + margin) {
+                var newLeft = Math.max(0, r.x - margin)
+                hbar.position = Math.min(maxHPos, newLeft / totalRowW)
+            } else if (r.x + r.width + margin > viewRight) {
+                var newLeft2 = Math.max(0, (r.x + r.width + margin) - codeViewW)
+                hbar.position = Math.min(maxHPos, newLeft2 / totalRowW)
+            }
+        }
     }
 
     function jumpToFunctionDefinition(symbolName) {
@@ -3378,7 +3499,7 @@ MuseScore {
                 }
             }
 
-            // Left Pane: Light-Theme Code Editor with Syntax Highlighting & Breakpoint Gutter
+            // Left Pane: Light-Theme Code Editor with Virtualized Syntax Highlighting & Breakpoint Gutter
             Rectangle {
                 QQC.SplitView.fillWidth: true
                 QQC.SplitView.minimumWidth: 260
@@ -3391,6 +3512,13 @@ MuseScore {
                     anchors.fill: parent
                     anchors.margins: 2
                     clip: true
+
+                    Connections {
+                        target: editorScroll.contentItem
+                        function onContentYChanged() {
+                            root.updateVisibleHighlightSlice()
+                        }
+                    }
 
                     Row {
                         id: editorRow
@@ -3463,7 +3591,7 @@ MuseScore {
                             }
                         }
 
-                        // Code Editor with Exact Character-Geometry Highlights & Syntax Overlay
+                        // Code Editor with Exact Character-Geometry Highlights & Virtualized Syntax Overlay
                         Item {
                             id: editorContainer
                             width: Math.max(editorScroll.availableWidth - gutter.width, Math.max(200, editor.contentWidth + 32))
@@ -3520,10 +3648,12 @@ MuseScore {
                                 }
                             }
 
-                            // Color-Only RichText Syntax Overlay (pixel-aligned with PlainText editor)
+                            // Virtualized Viewport-Only RichText Syntax Overlay
                             Text {
                                 id: highlightOverlay
-                                anchors.fill: parent
+                                x: 0
+                                y: root.highlightOverlayY
+                                width: parent.width
                                 topPadding: editor.topPadding
                                 bottomPadding: editor.bottomPadding
                                 leftPadding: editor.leftPadding
@@ -3557,32 +3687,26 @@ MuseScore {
                                 leftPadding: 8
                                 rightPadding: 16
 
-                                onImplicitHeightChanged: root.updateLineVisuals()
+                                onImplicitHeightChanged: {
+                                    root.updateVisibleHighlightSlice()
+                                    root.updateLineVisuals()
+                                }
                                 onSelectionStartChanged: root.updateBraceMatches()
                                 onSelectionEndChanged: root.updateBraceMatches()
                                 onCursorRectangleChanged: {
                                     root.updateBraceMatches()
-                                    var vbar = editorScroll.QQC.ScrollBar.vertical
-                                    if (!vbar || editor.implicitHeight <= editorScroll.availableHeight || editorScroll.availableHeight <= 0) return
-                                    if (editor.cursorRectangle.height <= 0) return
-                                    var viewTop = vbar.position * editor.implicitHeight
-                                    var viewBottom = viewTop + editorScroll.availableHeight
-                                    var curTop = editor.cursorRectangle.y
-                                    var curBottom = curTop + editor.cursorRectangle.height
-                                    var maxPos = Math.max(0, 1.0 - vbar.size)
-
-                                    if (curTop < viewTop) {
-                                        vbar.position = Math.min(maxPos, Math.max(0, curTop / editor.implicitHeight))
-                                    } else if (curBottom > viewBottom) {
-                                        var targetTop = curBottom - editorScroll.availableHeight
-                                        vbar.position = Math.min(maxPos, Math.max(0, targetTop / editor.implicitHeight))
-                                    }
+                                    root.ensureCursorVisibleInViewport()
                                 }
                                 onTextChanged: {
-                                    highlightTimer.restart()
+                                    var lineCountChanged = (editor.lineCount !== root.lastKnownLineCount)
+                                    root.updateHighlightIncremental()
                                     root.currentMatchStart = -1
                                     root.currentMatchEnd = -1
-                                    root.updateLineVisuals()
+                                    if (lineCountChanged) {
+                                        root.updateLineVisuals()
+                                    } else {
+                                        root.updateBraceMatches()
+                                    }
                                     root.isDirty = (editor.text !== root.cleanTextSnapshot)
                                     if (root.isDirty && !recoveryOverlay.visible) {
                                         autosaveTimer.restart()
